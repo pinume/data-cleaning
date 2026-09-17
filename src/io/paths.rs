@@ -77,7 +77,7 @@ pub fn list_xlsx_files(dir: &Path) -> Result<Vec<PathBuf>, ProcessError> {
     Ok(files)
 }
 
-/// 计算并确保`输入目录`的父目录下的`输出目录`（`output/`）存在。
+/// 计算并确保`输入目录`的父目录下的`输出目录`（`source_data/`）存在。
 pub fn ensure_output_dir(input_dir: &Path) -> Result<PathBuf, ProcessError> {
     let parent = input_dir
         .parent()
@@ -85,7 +85,7 @@ pub fn ensure_output_dir(input_dir: &Path) -> Result<PathBuf, ProcessError> {
             path: input_dir.to_path_buf(),
             reason: "无法确定父目录".to_string(),
         })?;
-    let output_dir = parent.join("output");
+    let output_dir = parent.join("source_data");
     std::fs::create_dir_all(&output_dir)?;
     Ok(output_dir)
 }
@@ -182,7 +182,7 @@ mod tests {
 
         let output_dir = ensure_output_dir(&input_dir).unwrap();
 
-        assert_eq!(output_dir, base.join("output"));
+        assert_eq!(output_dir, base.join("source_data"));
         assert!(output_dir.is_dir());
         std::fs::remove_dir_all(&base).unwrap();
     }

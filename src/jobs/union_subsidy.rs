@@ -6,7 +6,10 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, ProcessError, Row, Table, Value};
 use crate::utils::{dates, natural_sort};
 
-use super::{Category, Job, amount_value, cell_amount, cell_display, cell_text, text_value};
+use super::{
+    Category, Job, amount_value, cell_amount, cell_display, cell_text, check_duplicate_fingerprint,
+    data_error, parse_date_field, text_value,
+};
 
 const HEADERS: [&str; 33] = [
     "银商订单号",
@@ -105,66 +108,6 @@ fn standardize_category(value: String) -> String {
     }
 }
 
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    value: String,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value,
-        detail,
-    }
-}
-
-/// 交易日期：日期或日期时间无法识别时按数据异常终止（本节未给出"保留原值"的豁免）。
-fn parse_date_field(
-    cell: &RawCell,
-    file: &str,
-    sheet: &str,
-    row: u32,
-) -> Result<Value, ProcessError> {
-    match cell {
-        RawCell::Empty => Ok(Value::Empty),
-        RawCell::DateTime(serial) => dates::date_from_serial(*serial)
-            .map(Value::Date)
-            .ok_or_else(|| {
-                data_error(
-                    file,
-                    sheet,
-                    row,
-                    "交易日期",
-                    serial.to_string(),
-                    "无法解析为日期".to_string(),
-                )
-            }),
-        other => {
-            let text = cell_display(other);
-            if text.trim().is_empty() {
-                return Ok(Value::Empty);
-            }
-            dates::parse_date_text(&text)
-                .map(|dt| Value::Date(dt.date()))
-                .ok_or_else(|| {
-                    data_error(
-                        file,
-                        sheet,
-                        row,
-                        "交易日期",
-                        text.clone(),
-                        "无法解析为日期".to_string(),
-                    )
-                })
-        }
-    }
-}
-
 /// 交易时间：24 小时制，保留到秒；无法识别时按数据异常终止。
 fn parse_time_field(
     cell: &RawCell,
@@ -239,7 +182,7 @@ fn read_row(
         text_value(text_at(1, "银商订单号")?),
         text_value(text_at(2, "银商原订单号")?),
         text_value(text_at(3, "交易类型")?),
-        parse_date_field(&sheet.cell(row, 4), file, sheet_name, row)?,
+        parse_date_field(&sheet.cell(row, 4), "交易日期", file, sheet_name, row)?,
         parse_time_field(&sheet.cell(row, 5), file, sheet_name, row)?,
         text_value(text_at(6, "支付方式")?),
         amount_at(7, "订单金额")?,
@@ -333,17 +276,7 @@ impl Job for UnionSubsidyJob {
                 let last_row = sheet.last_value_row().unwrap_or(1);
 
                 let fingerprint = sheet_fingerprint(sheet, last_row);
-                if let Some(previous_file) = fingerprints.get(&fingerprint) {
-                    if previous_file != &file_name {
-                        return Err(ProcessError::Duplicate {
-                            detail: format!(
-                                "{file_name} 与 {previous_file} 的工作表内容完全相同，疑似重复导出"
-                            ),
-                        });
-                    }
-                } else {
-                    fingerprints.insert(fingerprint, file_name.clone());
-                }
+                check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
 
                 for row in 2..=last_row {
                     let record_row = read_row(sheet, row, &file_name, &sheet_name)?;

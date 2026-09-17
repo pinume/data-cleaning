@@ -1,16 +1,19 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use rust_decimal::Decimal;
 
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, ProcessError, Row, Table, Value};
-use crate::utils::{dates, doc_no, numbers, text};
+use crate::utils::{numbers, text};
 
 use super::unionpay;
-use super::{Category, Job, cell_display, cell_text, text_value};
+use super::{
+    Category, Job, build_match_doc_no, cell_display, cell_text, data_error, parse_date_field,
+    text_value,
+};
 
 const FILE_NAME: &str = "销售用券情况统计.xlsx";
 const TITLE: &str = "销售用券情况统计";
@@ -162,66 +165,6 @@ fn is_valid_ref_no(value: &str) -> bool {
         && value.as_bytes()[..11].iter().all(u8::is_ascii_digit)
 }
 
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    value: String,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value,
-        detail,
-    }
-}
-
-/// 单据日期：为空时保持为空；非空但无法识别时按数据异常终止。
-fn parse_date_field(
-    cell: &RawCell,
-    file: &str,
-    sheet: &str,
-    row: u32,
-) -> Result<Value, ProcessError> {
-    match cell {
-        RawCell::Empty => Ok(Value::Empty),
-        RawCell::DateTime(serial) => dates::date_from_serial(*serial)
-            .map(Value::Date)
-            .ok_or_else(|| {
-                data_error(
-                    file,
-                    sheet,
-                    row,
-                    "单据日期",
-                    serial.to_string(),
-                    "无法解析为日期".to_string(),
-                )
-            }),
-        other => {
-            let text = cell_display(other);
-            if text.trim().is_empty() {
-                return Ok(Value::Empty);
-            }
-            dates::parse_date_text(&text)
-                .map(|dt| Value::Date(dt.date()))
-                .ok_or_else(|| {
-                    data_error(
-                        file,
-                        sheet,
-                        row,
-                        "单据日期",
-                        text.clone(),
-                        "无法解析为日期".to_string(),
-                    )
-                })
-        }
-    }
-}
-
 /// 补贴额：取源字段`合计`，按 10.7 节尾差规则统一为两位小数；为空或超出容差时终止。
 fn parse_subsidy(
     cell: &RawCell,
@@ -230,7 +173,6 @@ fn parse_subsidy(
     row: u32,
 ) -> Result<Decimal, ProcessError> {
     let raw: Option<Decimal> = match cell {
-        RawCell::Empty => None,
         RawCell::Text(t) if t.trim().is_empty() => None,
         RawCell::Int(n) => Some(Decimal::from(*n)),
         RawCell::Float(f) => numbers::from_f64(*f),
@@ -273,7 +215,13 @@ fn read_row(
 
     Ok(CouponRecord {
         doc_no: text_at(COL_DOC_NO, "单据号")?,
-        doc_date: parse_date_field(&sheet.cell(row, COL_DOC_DATE), file, sheet_name, row)?,
+        doc_date: parse_date_field(
+            &sheet.cell(row, COL_DOC_DATE),
+            "单据日期",
+            file,
+            sheet_name,
+            row,
+        )?,
         product_name: text_at(COL_PRODUCT_NAME, "商品名称")?,
         brand: text_at(COL_BRAND, "品牌")?,
         finance_category: text_at(COL_FINANCE_CATEGORY, "财务大类")?,
@@ -291,17 +239,6 @@ fn quantity_of(subsidy: Decimal) -> i64 {
     }
 }
 
-/// 匹配单据号：单据日期或单据号为空时留空；否则`yymmdd`+去“收款”前缀的单据号直接拼接。
-fn build_match_doc_no(doc_date: &Value, doc_no_value: &str) -> String {
-    if doc_no_value.is_empty() {
-        return String::new();
-    }
-    match doc_date {
-        Value::Date(d) => doc_no::build_match_doc_no(*d, doc_no_value),
-        _ => String::new(),
-    }
-}
-
 fn to_row(record: CouponRecord, authority: &HashSet<String>) -> Row {
     let quantity = quantity_of(record.subsidy);
     let match_doc_no = build_match_doc_no(&record.doc_date, &record.doc_no);
@@ -315,7 +252,7 @@ fn to_row(record: CouponRecord, authority: &HashSet<String>) -> Row {
         text_value(record.finance_category),
         Value::Decimal(record.subsidy),
         Value::Integer(quantity),
-        reference.map(Value::Text).unwrap_or(Value::Empty),
+        reference.map_or(Value::Empty, Value::Text),
         text_value(match_doc_no),
     ];
     Row { values, fill: None }
@@ -407,8 +344,8 @@ fn extract_reference(summary: &str, authority: &HashSet<String>) -> Option<Strin
 }
 
 fn reference_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[0-9]{11}N").unwrap())
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9]{11}N").unwrap());
+    &RE
 }
 
 /// 第 1 级：原样提取完整`[0-9]{11}N`片段，前后不得紧邻数字或字母。
@@ -528,7 +465,7 @@ mod tests {
     use crate::test_support::unique_temp_path;
 
     fn authority_of(values: &[&str]) -> HashSet<String> {
-        values.iter().map(|s| s.to_string()).collect()
+        values.iter().map(ToString::to_string).collect()
     }
 
     #[test]

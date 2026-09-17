@@ -6,8 +6,7 @@ use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Table, 
 
 fn base_format(ty: ColumnType) -> Format {
     match ty {
-        ColumnType::Text => Format::new(),
-        ColumnType::Decimal(DecimalScale::Original) => Format::new(),
+        ColumnType::Text | ColumnType::Decimal(DecimalScale::Original) => Format::new(),
         ColumnType::Decimal(DecimalScale::Two) => Format::new().set_num_format("0.00"),
         ColumnType::Integer => Format::new().set_num_format("0"),
         ColumnType::Ratio => Format::new().set_num_format("0.00%"),

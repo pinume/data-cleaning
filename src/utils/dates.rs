@@ -34,10 +34,10 @@ pub fn parse_yyyymmdd(text: &str) -> Option<NaiveDate> {
 /// 解析`yyyy-mm-dd`、`yyyy/mm/dd`（可选带`HH:MM:SS`时间部分）文本为日期时间；
 /// 无时间部分时以当天零点补齐。
 pub fn parse_date_text(text: &str) -> Option<NaiveDateTime> {
-    let text = text.trim();
     const DATETIME_FORMATS: &[&str] = &["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"];
     const DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d"];
 
+    let text = text.trim();
     for format in DATETIME_FORMATS {
         if let Ok(dt) = NaiveDateTime::parse_from_str(text, format) {
             return Some(dt);

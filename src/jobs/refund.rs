@@ -8,10 +8,13 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 use crate::utils::numbers;
 
-use super::{Category, Job, amount_value, cell_amount, cell_display, cell_text, text_value};
+use super::{
+    Category, Job, amount_value, cell_amount, cell_display, cell_text, data_error, text_value,
+};
 
-const OUTPUT_FIELDS: [&str; 21] = [
+const OUTPUT_FIELDS: [&str; 24] = [
     "拨付批次",
+    "交易完成时间",
     "交易参考号",
     "商户订单号",
     "交易订单号",
@@ -28,13 +31,16 @@ const OUTPUT_FIELDS: [&str; 21] = [
     "能耗等级",
     "编码品类",
     "商品名称",
+    "发票金额",
     "发票号",
+    "发票头/购买方名称",
     "ID",
     "退回原因",
     "原拨付批次",
 ];
 
-const COLUMN_TYPES: [ColumnType; 21] = [
+const COLUMN_TYPES: [ColumnType; 24] = [
+    ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
@@ -52,16 +58,18 @@ const COLUMN_TYPES: [ColumnType; 21] = [
     ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
+    ColumnType::Decimal(DecimalScale::Two),
+    ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
 ];
 
-// 21 列固定顺序中的关键索引（0 基）。
-const OTHER_PAYMENT: usize = 6;
-const SUBSIDY_AMOUNT: usize = 9;
-const RATIO: usize = 10;
+// 24 列固定顺序中的关键索引（0 基）。
+const OTHER_PAYMENT: usize = 7;
+const SUBSIDY_AMOUNT: usize = 10;
+const RATIO: usize = 11;
 
 struct RefundConfig {
     category: Category,
@@ -69,8 +77,8 @@ struct RefundConfig {
     output_stem: &'static str,
     /// 文件名后缀，如`年以旧换新补贴明细.xlsx`；前面须为 4 位数字年份。
     filename_suffix: &'static str,
-    /// 每个统一字段（按 21 列顺序）对应的已确认同义源字段名候选集合。
-    field_synonyms: [&'static [&'static str]; 21],
+    /// 每个统一字段（按 24 列顺序）对应的已确认同义源字段名候选集合。
+    field_synonyms: [&'static [&'static str]; 24],
     /// 判定"批次明细表"的基础字段索引；缺失任一项即为待映射异常，终止处理。
     required_indices: &'static [usize],
     /// 重复分组依据字段的索引，按优先级排列。
@@ -79,8 +87,9 @@ struct RefundConfig {
     allow_dash_other_payment: bool,
 }
 
-const APPLIANCE_SYNONYMS: [&[&str]; 21] = [
+const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
     &["拨付批次"],
+    &["交易完成时间"],
     &["交易参考号"],
     &["商户订单号"],
     &["交易订单号"],
@@ -97,14 +106,16 @@ const APPLIANCE_SYNONYMS: [&[&str]; 21] = [
     &["能耗等级"],
     &["编码品类"],
     &["商品名称"],
+    &["发票金额"],
     &["发票号"],
+    &["发票头/购买方名称"],
     &["ID"],
     &["退回原因"],
     &["原拨付批次"],
 ];
 
 const APPLIANCE_REQUIRED: [usize; 19] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 21,
 ];
 
 const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
@@ -114,12 +125,13 @@ const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年以旧换新补贴明细.xlsx",
     field_synonyms: APPLIANCE_SYNONYMS,
     required_indices: &APPLIANCE_REQUIRED,
-    grouping_priority: [3, 2, 17], // 交易订单号 → 商户订单号 → 发票号
+    grouping_priority: [4, 3, 19], // 交易订单号 → 商户订单号 → 发票号
     allow_dash_other_payment: false,
 };
 
-const DIGITAL_SYNONYMS: [&[&str]; 21] = [
+const DIGITAL_SYNONYMS: [&[&str]; 24] = [
     &["拨付批次"],
+    &["交易完成时间"],
     &["参考号", "交易参考号"],
     &["商户订单号"],
     &["订单号", "交易订单号"],
@@ -136,13 +148,15 @@ const DIGITAL_SYNONYMS: [&[&str]; 21] = [
     &["能耗等级"],
     &["品类", "类别", "编码品类"],
     &["商品明细", "商品名称"],
+    &["发票金额"],
     &["发票号码", "发票号"],
+    &["发票头/购买方名称"],
     &["ID"],
     &["退回原因"],
     &["原拨付批次"],
 ];
 
-const DIGITAL_REQUIRED: [usize; 13] = [0, 1, 2, 4, 5, 7, 9, 11, 12, 13, 15, 16, 17];
+const DIGITAL_REQUIRED: [usize; 13] = [0, 2, 3, 5, 6, 8, 10, 12, 13, 14, 16, 17, 19];
 
 const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     category: Category::RefundDigital,
@@ -151,7 +165,7 @@ const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年数码补贴明细.xlsx",
     field_synonyms: DIGITAL_SYNONYMS,
     required_indices: &DIGITAL_REQUIRED,
-    grouping_priority: [1, 2, 17], // 交易参考号 → 商户订单号 → 发票号
+    grouping_priority: [2, 3, 19], // 交易参考号 → 商户订单号 → 发票号
     allow_dash_other_payment: true,
 };
 
@@ -183,24 +197,6 @@ fn matches_filename(name: &str, suffix: &str) -> bool {
     match name.strip_suffix(suffix) {
         Some(year) => year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()),
         None => false,
-    }
-}
-
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    value: String,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value,
-        detail,
     }
 }
 
@@ -276,14 +272,10 @@ fn read_row(
     file: &str,
     sheet_name: &str,
 ) -> Result<Vec<Value>, ProcessError> {
-    let cell_at = |index: usize| {
-        columns[index]
-            .map(|col| sheet.cell(row, col))
-            .unwrap_or(RawCell::Empty)
-    };
+    let cell_at = |index: usize| columns[index].map_or(RawCell::Empty, |col| sheet.cell(row, col));
 
-    let mut values = Vec::with_capacity(21);
-    for index in 0..21 {
+    let mut values = Vec::with_capacity(24);
+    for index in 0..24 {
         let cell = cell_at(index);
         let field = OUTPUT_FIELDS[index];
         let value = if index == OTHER_PAYMENT {
@@ -308,7 +300,7 @@ fn read_row(
             Value::Decimal(amount)
         } else if index == RATIO {
             cell_ratio(&cell)
-                .map(|ratio| ratio.map(Value::Ratio).unwrap_or(Value::Empty))
+                .map(|ratio| ratio.map_or(Value::Empty, Value::Ratio))
                 .map_err(|detail| {
                     data_error(file, sheet_name, row, field, cell_display(&cell), detail)
                 })?
@@ -460,7 +452,7 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
         let sheet_name = sheet.name().to_string();
         let header = sheet.row_texts(1);
 
-        let mut columns: Vec<Option<u32>> = Vec::with_capacity(21);
+        let mut columns: Vec<Option<u32>> = Vec::with_capacity(24);
         for synonyms in &config.field_synonyms {
             let resolved = resolve_synonym_column(&header, synonyms).map_err(|detail| {
                 ProcessError::Structure {
@@ -637,15 +629,63 @@ mod tests {
 
         let table = REFUND_APPLIANCE.run(&dir).unwrap();
 
-        assert_eq!(table.columns.len(), 21);
+        assert_eq!(table.columns.len(), 24);
         assert_eq!(table.rows.len(), 2);
         assert_eq!(label_of(&table.rows[0]), "R1");
         assert_eq!(label_of(&table.rows[1]), "R2");
         // 退回原因、原拨付批次源表无对应字段，留空。
-        assert_eq!(table.rows[0].values[19], Value::Empty);
-        assert_eq!(table.rows[0].values[20], Value::Empty);
+        assert_eq!(table.rows[0].values[22], Value::Empty);
+        assert_eq!(table.rows[0].values[23], Value::Empty);
         // 销方名称已统一映射为销售企业名称的值。
-        assert_eq!(table.rows[0].values[4], Value::Text("企业甲".to_string()));
+        assert_eq!(table.rows[0].values[5], Value::Text("企业甲".to_string()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn maps_new_optional_fields_when_present_and_blank_when_absent() {
+        let dir = unique_temp_path("refund-optional-new-fields");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut header_with_new_fields = APPLIANCE_HEADER.to_vec();
+        header_with_new_fields.insert(1, "交易完成时间");
+        header_with_new_fields.insert(18, "发票金额"); // 插入到“发票号”之前
+        header_with_new_fields.insert(20, "发票头/购买方名称"); // 插入到“ID”之前
+
+        let mut row_with_new_fields = appliance_row("WITH", "M1", "T1", "10.00");
+        row_with_new_fields.insert(1, "2026-01-01 20:14:22".to_string());
+        row_with_new_fields.insert(18, "6129".to_string());
+        row_with_new_fields.insert(20, "王惠霞".to_string());
+
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[
+                ("有新字段", &header_with_new_fields, &[row_with_new_fields]),
+                (
+                    "无新字段",
+                    &APPLIANCE_HEADER,
+                    &[appliance_row("WITHOUT", "M2", "T2", "10.00")],
+                ),
+            ],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        let with_row = table.rows.iter().find(|r| label_of(r) == "WITH").unwrap();
+        assert_eq!(
+            with_row.values[1],
+            Value::Text("2026-01-01 20:14:22".to_string())
+        );
+        assert_eq!(with_row.values[18], Value::Decimal("6129".parse().unwrap()));
+        assert_eq!(with_row.values[20], Value::Text("王惠霞".to_string()));
+
+        let without_row = table
+            .rows
+            .iter()
+            .find(|r| label_of(r) == "WITHOUT")
+            .unwrap();
+        assert_eq!(without_row.values[1], Value::Empty);
+        assert_eq!(without_row.values[18], Value::Empty);
+        assert_eq!(without_row.values[20], Value::Empty);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -673,7 +713,7 @@ mod tests {
         workbook.save(&path).unwrap();
 
         let table = REFUND_APPLIANCE.run(&dir).unwrap();
-        assert_eq!(table.rows[0].values[5], Value::Text("#N/A".to_string()));
+        assert_eq!(table.rows[0].values[6], Value::Text("#N/A".to_string()));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -781,7 +821,7 @@ mod tests {
         );
 
         let table = REFUND_APPLIANCE.run(&dir).unwrap();
-        match table.rows[0].values[10] {
+        match table.rows[0].values[RATIO] {
             Value::Ratio(ratio) => assert_eq!(ratio, "0.15".parse().unwrap()),
             _ => panic!("expected ratio"),
         }

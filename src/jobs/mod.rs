@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use rust_decimal::Decimal;
 
 use crate::io::xlsx_reader::RawCell;
 use crate::model::{ProcessError, Table, Value};
-use crate::utils::{dates, numbers, text};
+use crate::utils::{dates, doc_no, numbers, text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -64,7 +65,7 @@ pub(crate) fn text_value(value: String) -> Value {
 
 /// `None`转换为`Value::Empty`，否则包装为`Value::Decimal`。
 pub(crate) fn amount_value(value: Option<Decimal>) -> Value {
-    value.map(Value::Decimal).unwrap_or(Value::Empty)
+    value.map_or(Value::Empty, Value::Decimal)
 }
 
 /// 数值字段：为空时保持为空，不做尾差取整（显示格式如`0.00`只影响展示，不改变实际值）。
@@ -91,32 +92,121 @@ pub(crate) fn cell_amount(cell: &RawCell) -> Result<Option<Decimal>, String> {
 pub(crate) fn cell_date_or_text(cell: &RawCell) -> Value {
     if let RawCell::DateTime(serial) = cell {
         return dates::date_from_serial(*serial)
-            .map(Value::Date)
-            .unwrap_or_else(|| Value::Text(cell_display(cell)));
+            .map_or_else(|| Value::Text(cell_display(cell)), Value::Date);
     }
     let text = cell_display(cell);
     if text.trim().is_empty() {
         return Value::Empty;
     }
-    dates::parse_yyyymmdd(&text)
-        .map(Value::Date)
-        .unwrap_or(Value::Text(text))
+    dates::parse_yyyymmdd(&text).map_or(Value::Text(text), Value::Date)
 }
 
 /// 日期时间字段：保留到秒；无法识别时保留原值，不猜测修正（第 5、6 节的通用豁免）。
 pub(crate) fn cell_datetime_or_text(cell: &RawCell) -> Value {
     if let RawCell::DateTime(serial) = cell {
         return dates::datetime_from_serial(*serial)
-            .map(Value::DateTime)
-            .unwrap_or_else(|| Value::Text(cell_display(cell)));
+            .map_or_else(|| Value::Text(cell_display(cell)), Value::DateTime);
     }
     let text = cell_display(cell);
     if text.trim().is_empty() {
         return Value::Empty;
     }
-    dates::parse_date_text(&text)
-        .map(Value::DateTime)
-        .unwrap_or(Value::Text(text))
+    dates::parse_date_text(&text).map_or(Value::Text(text), Value::DateTime)
+}
+
+/// 数据异常错误的统一构造函数：文件名、工作表名、行号、字段名、原始值、异常说明。
+pub(crate) fn data_error(
+    file: &str,
+    sheet: &str,
+    row: u32,
+    field: &str,
+    value: String,
+    detail: String,
+) -> ProcessError {
+    ProcessError::Data {
+        file: file.to_string(),
+        sheet: sheet.to_string(),
+        row,
+        field: field.to_string(),
+        value,
+        detail,
+    }
+}
+
+/// 日期字段：为空时保持为空；非空但无法识别时按数据异常终止（无“保留原值”豁免的场景，
+/// 与`cell_date_or_text`的第 5、6 节豁免相对）。
+pub(crate) fn parse_date_field(
+    cell: &RawCell,
+    field: &str,
+    file: &str,
+    sheet: &str,
+    row: u32,
+) -> Result<Value, ProcessError> {
+    match cell {
+        RawCell::Empty => Ok(Value::Empty),
+        RawCell::DateTime(serial) => dates::date_from_serial(*serial)
+            .map(Value::Date)
+            .ok_or_else(|| {
+                data_error(
+                    file,
+                    sheet,
+                    row,
+                    field,
+                    serial.to_string(),
+                    "无法解析为日期".to_string(),
+                )
+            }),
+        other => {
+            let text = cell_display(other);
+            if text.trim().is_empty() {
+                return Ok(Value::Empty);
+            }
+            dates::parse_date_text(&text)
+                .map(|dt| Value::Date(dt.date()))
+                .ok_or_else(|| {
+                    data_error(
+                        file,
+                        sheet,
+                        row,
+                        field,
+                        text.clone(),
+                        "无法解析为日期".to_string(),
+                    )
+                })
+        }
+    }
+}
+
+/// 由`Value::Date`与去“收款”前缀的单据号拼接匹配单据号；`doc_no_value`为空或`date`不是
+/// `Value::Date`时留空（第9、10节共用）。
+pub(crate) fn build_match_doc_no(date: &Value, doc_no_value: &str) -> String {
+    if doc_no_value.is_empty() {
+        return String::new();
+    }
+    match date {
+        Value::Date(d) => doc_no::build_match_doc_no(*d, doc_no_value),
+        _ => String::new(),
+    }
+}
+
+/// 记录并检查工作表内容指纹：同一指纹已属于另一个文件时判定为疑似重复导出并报错；
+/// 否则记录该指纹归属的当前文件。
+pub(crate) fn check_duplicate_fingerprint(
+    fingerprints: &mut HashMap<String, String>,
+    fingerprint: String,
+    file_name: &str,
+) -> Result<(), ProcessError> {
+    if let Some(previous_file) = fingerprints.get(&fingerprint)
+        && previous_file != file_name
+    {
+        return Err(ProcessError::Duplicate {
+            detail: format!("{file_name} 与 {previous_file} 的工作表内容完全相同，疑似重复导出"),
+        });
+    }
+    fingerprints
+        .entry(fingerprint)
+        .or_insert_with(|| file_name.to_string());
+    Ok(())
 }
 
 pub mod coupons;

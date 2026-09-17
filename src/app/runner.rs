@@ -69,7 +69,7 @@ mod tests {
     use crate::jobs::unionpay;
     use crate::test_support::unique_temp_path;
 
-    /// 端到端验证 execute() 真正把 job 的结果写盘并发布到正确的兄弟 output/ 目录，
+    /// 端到端验证 `execute()` 真正把 job 的结果写盘并发布到正确的兄弟 `source_data/` 目录，
     /// 而不仅仅是业务逻辑本身（业务逻辑已由各 job 自己的单元测试覆盖）。
     #[test]
     fn execute_publishes_real_file_to_sibling_output_dir() {
@@ -122,10 +122,10 @@ mod tests {
 
         run_one(&input_dir, 5);
 
-        let output_path = base.join("output").join("银联交易明细门店.xlsx");
+        let output_path = base.join("source_data").join("银联交易明细门店.xlsx");
         assert!(
             output_path.is_file(),
-            "应在输入目录同级的 output/ 下生成结果文件"
+            "应在输入目录同级的 source_data/ 下生成结果文件"
         );
 
         // 确认写出的文件是一个真正可被读回的 XLSX（而不仅仅是存在同名文件）。

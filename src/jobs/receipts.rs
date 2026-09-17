@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
+use crate::io::xlsx_reader::{SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, ProcessError, Row, Table, Value};
-use crate::utils::{dates, doc_no};
 
-use super::{Category, Job, cell_display, cell_text, text_value};
+use super::{
+    Category, Job, build_match_doc_no, cell_display, cell_text, data_error, parse_date_field,
+    text_value,
+};
 
 const FILE_NAME: &str = "收款单统计.xlsx";
 
@@ -159,84 +161,13 @@ impl Job for ReceiptsJob {
     }
 }
 
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    value: String,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value,
-        detail,
-    }
-}
-
-/// 日期：为空时保持为空；非空但无法识别时按数据异常终止（本节未给出保留原值的豁免）。
-fn parse_date_field(
-    cell: &RawCell,
-    file: &str,
-    sheet: &str,
-    row: u32,
-) -> Result<Value, ProcessError> {
-    match cell {
-        RawCell::Empty => Ok(Value::Empty),
-        RawCell::DateTime(serial) => dates::date_from_serial(*serial)
-            .map(Value::Date)
-            .ok_or_else(|| {
-                data_error(
-                    file,
-                    sheet,
-                    row,
-                    "日期",
-                    serial.to_string(),
-                    "无法解析为日期".to_string(),
-                )
-            }),
-        other => {
-            let text = cell_display(other);
-            if text.trim().is_empty() {
-                return Ok(Value::Empty);
-            }
-            dates::parse_date_text(&text)
-                .map(|dt| Value::Date(dt.date()))
-                .ok_or_else(|| {
-                    data_error(
-                        file,
-                        sheet,
-                        row,
-                        "日期",
-                        text.clone(),
-                        "无法解析为日期".to_string(),
-                    )
-                })
-        }
-    }
-}
-
-/// 匹配单据号：日期或单据号为空时留空；否则`yymmdd`+去“收款”前缀的单据号直接拼接。
-fn build_match_doc_no(date: &Value, doc_no_value: &str) -> String {
-    if doc_no_value.is_empty() {
-        return String::new();
-    }
-    match date {
-        Value::Date(d) => doc_no::build_match_doc_no(*d, doc_no_value),
-        _ => String::new(),
-    }
-}
-
 fn read_row(
     sheet: &SheetGrid,
     row: u32,
     file: &str,
     sheet_name: &str,
 ) -> Result<ReceiptRecord, ProcessError> {
-    let date = parse_date_field(&sheet.cell(row, COL_DATE), file, sheet_name, row)?;
+    let date = parse_date_field(&sheet.cell(row, COL_DATE), "日期", file, sheet_name, row)?;
 
     let text_at = |col: u32, field: &'static str| -> Result<String, ProcessError> {
         let cell = sheet.cell(row, col);

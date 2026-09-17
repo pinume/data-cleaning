@@ -9,7 +9,7 @@ use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Ta
 
 use super::{
     Category, Job, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text,
-    cell_display, cell_text, text_value,
+    cell_display, cell_text, check_duplicate_fingerprint, text_value,
 };
 
 pub(crate) const HEADERS: [&str; 26] = [
@@ -275,17 +275,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
             }
 
             let fingerprint = sheet_fingerprint(sheet, last_row);
-            if let Some(previous_file) = fingerprints.get(&fingerprint) {
-                if previous_file != &file_name {
-                    return Err(ProcessError::Duplicate {
-                        detail: format!(
-                            "{file_name} 与 {previous_file} 的工作表内容完全相同，疑似重复导出"
-                        ),
-                    });
-                }
-            } else {
-                fingerprints.insert(fingerprint, file_name.clone());
-            }
+            check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
 
             for row in 3..last_row {
                 records.push(read_record(sheet, row, &file_name, &sheet_name)?);

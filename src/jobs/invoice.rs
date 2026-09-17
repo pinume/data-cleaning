@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use chrono::NaiveDate;
 use regex::Regex;
@@ -10,7 +10,7 @@ use crate::io::xlsx_reader::{RawCell, open_sheets};
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
 use crate::utils::{dates, doc_no};
 
-use super::{Category, Job, cell_display, cell_text, text_value};
+use super::{Category, Job, cell_display, cell_text, data_error, text_value};
 
 const SOURCE_HEADERS: [&str; 30] = [
     "订单号",
@@ -140,20 +140,20 @@ fn apply_known_remark_fixes(remark: &str) -> String {
 }
 
 fn date_label_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?:销售日期|购机日期)[：:、\s]*([0-9]{2,4})[-./年]([0-9]{1,2})[-./月]([0-9]{1,2})日?",
         )
         .unwrap()
-    })
+    });
+    &RE
 }
 
 fn doc_no_label_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?:单据号|单据收款号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9]+)").unwrap()
-    })
+    });
+    &RE
 }
 
 fn parse_labeled_date(year: &str, month: &str, day: &str) -> Option<NaiveDate> {
@@ -214,24 +214,6 @@ fn build_match_doc_no(remark: &str) -> Option<String> {
     let normalized = normalize_document_no(stripped)?;
 
     Some(doc_no::build_match_doc_no(date, &normalized))
-}
-
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    value: String,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value,
-        detail,
-    }
 }
 
 /// 开票时间：为空时保持为空；非空但无法识别时按数据异常终止。
@@ -394,9 +376,7 @@ impl Job for InvoiceJob {
                 invoice_no,
                 buyer_name,
                 product_name: clean_product_name(&raw_product_name),
-                match_doc_no: build_match_doc_no(&remark)
-                    .map(Value::Text)
-                    .unwrap_or(Value::Empty),
+                match_doc_no: build_match_doc_no(&remark).map_or(Value::Empty, Value::Text),
                 remark,
                 invoice_status,
             });
