@@ -1,0 +1,891 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use rust_decimal::Decimal;
+
+use crate::io::paths::list_xlsx_files;
+use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
+use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
+use crate::utils::numbers;
+
+use super::{Category, Job, amount_value, cell_amount, cell_display, cell_text, text_value};
+
+const OUTPUT_FIELDS: [&str; 21] = [
+    "拨付批次",
+    "交易参考号",
+    "商户订单号",
+    "交易订单号",
+    "销售企业名称",
+    "核销商编",
+    "其他支付",
+    "销售金额",
+    "实收销售金额",
+    "补贴金额",
+    "补贴比例",
+    "SN码",
+    "所在地区",
+    "商品编码",
+    "能耗等级",
+    "编码品类",
+    "商品名称",
+    "发票号",
+    "ID",
+    "退回原因",
+    "原拨付批次",
+];
+
+const COLUMN_TYPES: [ColumnType; 21] = [
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Decimal(DecimalScale::Two),
+    ColumnType::Decimal(DecimalScale::Two),
+    ColumnType::Decimal(DecimalScale::Two),
+    ColumnType::Decimal(DecimalScale::Two),
+    ColumnType::Ratio,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+];
+
+// 21 列固定顺序中的关键索引（0 基）。
+const OTHER_PAYMENT: usize = 6;
+const SUBSIDY_AMOUNT: usize = 9;
+const RATIO: usize = 10;
+
+struct RefundConfig {
+    category: Category,
+    title: &'static str,
+    output_stem: &'static str,
+    /// 文件名后缀，如`年以旧换新补贴明细.xlsx`；前面须为 4 位数字年份。
+    filename_suffix: &'static str,
+    /// 每个统一字段（按 21 列顺序）对应的已确认同义源字段名候选集合。
+    field_synonyms: [&'static [&'static str]; 21],
+    /// 判定"批次明细表"的基础字段索引；缺失任一项即为待映射异常，终止处理。
+    required_indices: &'static [usize],
+    /// 重复分组依据字段的索引，按优先级排列。
+    grouping_priority: [usize; 3],
+    /// 是否允许"其他支付"保留文本`-`（数码回款明细特有）。
+    allow_dash_other_payment: bool,
+}
+
+const APPLIANCE_SYNONYMS: [&[&str]; 21] = [
+    &["拨付批次"],
+    &["交易参考号"],
+    &["商户订单号"],
+    &["交易订单号"],
+    &["销方名称", "销售企业名称"],
+    &["商户编号", "核销商编"],
+    &["其他支付"],
+    &["应收销售金额", "销售金额"],
+    &["实收销售金额"],
+    &["补贴金额"],
+    &["补贴比例"],
+    &["SN码"],
+    &["所在地区"],
+    &["商品编码"],
+    &["能耗等级"],
+    &["编码品类"],
+    &["商品名称"],
+    &["发票号"],
+    &["ID"],
+    &["退回原因"],
+    &["原拨付批次"],
+];
+
+const APPLIANCE_REQUIRED: [usize; 19] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
+
+const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
+    category: Category::RefundAppliance,
+    title: "家电电脑回款明细",
+    output_stem: "回款明细家电电脑",
+    filename_suffix: "年以旧换新补贴明细.xlsx",
+    field_synonyms: APPLIANCE_SYNONYMS,
+    required_indices: &APPLIANCE_REQUIRED,
+    grouping_priority: [3, 2, 17], // 交易订单号 → 商户订单号 → 发票号
+    allow_dash_other_payment: false,
+};
+
+const DIGITAL_SYNONYMS: [&[&str]; 21] = [
+    &["拨付批次"],
+    &["参考号", "交易参考号"],
+    &["商户订单号"],
+    &["订单号", "交易订单号"],
+    &["销方名称", "销售企业名称"],
+    &["经销商编号", "商户编号", "核销商编"],
+    &["其他支付"],
+    &["应收销售金额", "销售金额"],
+    &["实收销售金额"],
+    &["补贴销售金额", "补贴金额"],
+    &["补贴比例/补贴限额", "补贴比例"],
+    &["SN码"],
+    &["所在地区"],
+    &["商品编码"],
+    &["能耗等级"],
+    &["品类", "类别", "编码品类"],
+    &["商品明细", "商品名称"],
+    &["发票号码", "发票号"],
+    &["ID"],
+    &["退回原因"],
+    &["原拨付批次"],
+];
+
+const DIGITAL_REQUIRED: [usize; 13] = [0, 1, 2, 4, 5, 7, 9, 11, 12, 13, 15, 16, 17];
+
+const DIGITAL_CONFIG: RefundConfig = RefundConfig {
+    category: Category::RefundDigital,
+    title: "数码回款明细",
+    output_stem: "回款明细数码",
+    filename_suffix: "年数码补贴明细.xlsx",
+    field_synonyms: DIGITAL_SYNONYMS,
+    required_indices: &DIGITAL_REQUIRED,
+    grouping_priority: [1, 2, 17], // 交易参考号 → 商户订单号 → 发票号
+    allow_dash_other_payment: true,
+};
+
+pub struct RefundJob(&'static RefundConfig);
+
+pub const REFUND_APPLIANCE: RefundJob = RefundJob(&APPLIANCE_CONFIG);
+pub const REFUND_DIGITAL: RefundJob = RefundJob(&DIGITAL_CONFIG);
+
+impl Job for RefundJob {
+    fn category(&self) -> Category {
+        self.0.category
+    }
+
+    fn title(&self) -> &'static str {
+        self.0.title
+    }
+
+    fn output_stem(&self) -> &'static str {
+        self.0.output_stem
+    }
+
+    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+        run_refund(self.0, input_dir)
+    }
+}
+
+/// 文件名须为`<4 位年份><后缀>`，如`2026年以旧换新补贴明细.xlsx`。
+fn matches_filename(name: &str, suffix: &str) -> bool {
+    match name.strip_suffix(suffix) {
+        Some(year) => year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn data_error(
+    file: &str,
+    sheet: &str,
+    row: u32,
+    field: &str,
+    value: String,
+    detail: String,
+) -> ProcessError {
+    ProcessError::Data {
+        file: file.to_string(),
+        sheet: sheet.to_string(),
+        row,
+        field: field.to_string(),
+        value,
+        detail,
+    }
+}
+
+/// 在表头中查找某统一字段的实际列号：候选同义词中恰好一个出现时返回该列号；
+/// 均未出现时返回`None`（该字段在此工作表缺失）；多个同义词同时出现视为结构异常。
+fn resolve_synonym_column(header: &[String], synonyms: &[&str]) -> Result<Option<u32>, String> {
+    let mut found = Vec::new();
+    for &synonym in synonyms {
+        if let Some(position) = header.iter().position(|name| name == synonym) {
+            found.push(position as u32 + 1);
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [column] => Ok(Some(*column)),
+        _ => Err(format!("字段候选名称 {synonyms:?} 在表头中出现多个匹配")),
+    }
+}
+
+/// 比例字段：接受十进制数值，或带`%`的文本（按 100 换算为底层比例）。
+fn cell_ratio(cell: &RawCell) -> Result<Option<Decimal>, String> {
+    match cell {
+        RawCell::Empty => Ok(None),
+        RawCell::Text(t) if t.trim().is_empty() => Ok(None),
+        RawCell::Text(t) => {
+            let trimmed = t.trim();
+            let (numeric, is_percent) = match trimmed.strip_suffix('%') {
+                Some(rest) => (rest.trim(), true),
+                None => (trimmed, false),
+            };
+            let value: Decimal = numeric
+                .parse()
+                .map_err(|_| format!("文本“{t}”无法解析为比例"))?;
+            Ok(Some(if is_percent {
+                value / Decimal::from(100)
+            } else {
+                value
+            }))
+        }
+        RawCell::Int(n) => Ok(Some(Decimal::from(*n))),
+        RawCell::Float(f) => numbers::from_f64(*f)
+            .map(Some)
+            .ok_or_else(|| format!("数值 {f} 无法转换为比例")),
+        other => Err(format!("比例字段出现非数值内容：{}", cell_display(other))),
+    }
+}
+
+/// 其他支付：允许时把文本`-`原样保留为`Value::Text("-")`，否则按普通数值字段处理。
+fn read_other_payment(cell: &RawCell, allow_dash: bool) -> Result<Value, String> {
+    if allow_dash
+        && let RawCell::Text(t) = cell
+        && t.trim() == "-"
+    {
+        return Ok(Value::Text("-".to_string()));
+    }
+    cell_amount(cell).map(amount_value)
+}
+
+/// 文本字段：与共享的`cell_text`相比，遇到 Excel 错误值（如`#N/A`）时原样保留为文本，
+/// 不终止处理——已确认：源表中的错误值（如查找表未匹配的核销商编）按原样输出，不做推断。
+fn cell_text_tolerant(cell: &RawCell) -> Result<String, String> {
+    match cell {
+        RawCell::Error(_) => Ok(cell_display(cell)),
+        other => cell_text(other),
+    }
+}
+
+fn read_row(
+    sheet: &SheetGrid,
+    row: u32,
+    columns: &[Option<u32>],
+    config: &RefundConfig,
+    file: &str,
+    sheet_name: &str,
+) -> Result<Vec<Value>, ProcessError> {
+    let cell_at = |index: usize| {
+        columns[index]
+            .map(|col| sheet.cell(row, col))
+            .unwrap_or(RawCell::Empty)
+    };
+
+    let mut values = Vec::with_capacity(21);
+    for index in 0..21 {
+        let cell = cell_at(index);
+        let field = OUTPUT_FIELDS[index];
+        let value = if index == OTHER_PAYMENT {
+            read_other_payment(&cell, config.allow_dash_other_payment).map_err(|detail| {
+                data_error(file, sheet_name, row, field, cell_display(&cell), detail)
+            })?
+        } else if index == SUBSIDY_AMOUNT {
+            let amount = cell_amount(&cell)
+                .map_err(|detail| {
+                    data_error(file, sheet_name, row, field, cell_display(&cell), detail)
+                })?
+                .ok_or_else(|| {
+                    data_error(
+                        file,
+                        sheet_name,
+                        row,
+                        field,
+                        cell_display(&cell),
+                        "补贴金额为空或无法解析，不得参与求和".to_string(),
+                    )
+                })?;
+            Value::Decimal(amount)
+        } else if index == RATIO {
+            cell_ratio(&cell)
+                .map(|ratio| ratio.map(Value::Ratio).unwrap_or(Value::Empty))
+                .map_err(|detail| {
+                    data_error(file, sheet_name, row, field, cell_display(&cell), detail)
+                })?
+        } else if matches!(COLUMN_TYPES[index], ColumnType::Decimal(_)) {
+            cell_amount(&cell).map(amount_value).map_err(|detail| {
+                data_error(file, sheet_name, row, field, cell_display(&cell), detail)
+            })?
+        } else {
+            text_value(cell_text_tolerant(&cell).map_err(|detail| {
+                data_error(file, sheet_name, row, field, cell_display(&cell), detail)
+            })?)
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// 分组依据：优先级中首个非空文本字段的`(字段索引, 去首尾空白后的值)`；
+/// 索引本身即代表"字段类型"，天然避免不同字段交叉匹配。
+fn grouping_key(values: &[Value], priority: [usize; 3]) -> Option<(usize, String)> {
+    for index in priority {
+        if let Value::Text(text) = &values[index] {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some((index, trimmed.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn subsidy_amount(values: &[Value]) -> Decimal {
+    match &values[SUBSIDY_AMOUNT] {
+        Value::Decimal(amount) => *amount,
+        _ => unreachable!("补贴金额在读取阶段已确保为 Decimal"),
+    }
+}
+
+/// 第 7.5/8.6 节：跨批次统一分组、按补贴金额合计沉底；未沉底记录在前，沉底记录在后，
+/// 两个区域内部均保持合并后的原相对顺序。
+fn classify_and_sink(records: Vec<Vec<Value>>, priority: [usize; 3]) -> Vec<Row> {
+    let mut groups: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+    for (index, values) in records.iter().enumerate() {
+        if let Some(key) = grouping_key(values, priority) {
+            groups.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut sink: HashSet<usize> = HashSet::new();
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let total = indices
+            .iter()
+            .fold(Decimal::ZERO, |acc, &i| acc + subsidy_amount(&records[i]));
+        if total <= Decimal::ZERO {
+            sink.extend(indices.iter().copied());
+        } else {
+            let last = *indices.iter().max().unwrap();
+            sink.extend(indices.iter().copied().filter(|&i| i != last));
+        }
+    }
+
+    let mut normal = Vec::new();
+    let mut sunk = Vec::new();
+    for (index, values) in records.into_iter().enumerate() {
+        if sink.contains(&index) {
+            sunk.push(Row {
+                values,
+                fill: Some(Fill::Pink),
+            });
+        } else {
+            normal.push(Row { values, fill: None });
+        }
+    }
+    normal.into_iter().chain(sunk).collect()
+}
+
+fn output_columns() -> Vec<Column> {
+    OUTPUT_FIELDS
+        .iter()
+        .zip(COLUMN_TYPES)
+        .map(|(&name, ty)| Column { name, ty })
+        .collect()
+}
+
+/// 在候选文件中选择文件名年份最新的一个；不合并较早年份的文件。
+fn select_latest_file(candidates: Vec<PathBuf>, suffix: &str) -> Result<PathBuf, ProcessError> {
+    let dated: Vec<(PathBuf, u32)> = candidates
+        .into_iter()
+        .map(|path| {
+            let year = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(suffix))
+                .and_then(|y| y.parse::<u32>().ok())
+                .expect("candidates are pre-filtered by matches_filename");
+            (path, year)
+        })
+        .collect();
+
+    let max_year = dated.iter().map(|(_, year)| *year).max().unwrap();
+    let mut latest: Vec<_> = dated
+        .into_iter()
+        .filter(|(_, year)| *year == max_year)
+        .collect();
+    if latest.len() > 1 {
+        let names = latest
+            .iter()
+            .filter_map(|(path, _)| path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("、");
+        return Err(ProcessError::Structure {
+            file: names,
+            sheet: String::new(),
+            detail: "最新年份无法唯一确定：多个文件对应同一最新年份".to_string(),
+        });
+    }
+    Ok(latest.pop().unwrap().0)
+}
+
+fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessError> {
+    let candidates: Vec<PathBuf> = list_xlsx_files(input_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| matches_filename(n, config.filename_suffix))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(ProcessError::NoInput {
+            pattern: format!("yyyy{}", config.filename_suffix),
+        });
+    }
+    let path = select_latest_file(candidates, config.filename_suffix)?;
+    let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+    let sheets = open_sheets(&path)?;
+    let mut records: Vec<Vec<Value>> = Vec::new();
+
+    for sheet in &sheets {
+        if sheet.name() == "汇总" {
+            continue;
+        }
+        let sheet_name = sheet.name().to_string();
+        let header = sheet.row_texts(1);
+
+        let mut columns: Vec<Option<u32>> = Vec::with_capacity(21);
+        for synonyms in &config.field_synonyms {
+            let resolved = resolve_synonym_column(&header, synonyms).map_err(|detail| {
+                ProcessError::Structure {
+                    file: file_name.clone(),
+                    sheet: sheet_name.clone(),
+                    detail,
+                }
+            })?;
+            columns.push(resolved);
+        }
+
+        let missing: Vec<&str> = config
+            .required_indices
+            .iter()
+            .filter(|&&i| columns[i].is_none())
+            .map(|&i| OUTPUT_FIELDS[i])
+            .collect();
+        if !missing.is_empty() {
+            return Err(ProcessError::Structure {
+                file: file_name,
+                sheet: sheet_name,
+                detail: format!("待映射异常：缺少基础字段 {}", missing.join("、")),
+            });
+        }
+
+        let last_row = sheet.last_value_row().unwrap_or(1);
+        for row in 2..=last_row {
+            records.push(read_row(
+                sheet,
+                row,
+                &columns,
+                config,
+                &file_name,
+                &sheet_name,
+            )?);
+        }
+    }
+
+    let rows = classify_and_sink(records, config.grouping_priority);
+    Ok(Table {
+        columns: output_columns(),
+        rows,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_xlsxwriter::{Formula, Workbook};
+
+    use super::*;
+    use crate::test_support::unique_temp_path;
+
+    type SheetSpec<'a> = (&'a str, &'a [&'a str], &'a [Vec<String>]);
+
+    fn write_workbook(path: &Path, sheets: &[SheetSpec]) {
+        let mut workbook = Workbook::new();
+        for (name, header, rows) in sheets {
+            let sheet = workbook.add_worksheet();
+            sheet.set_name(*name).unwrap();
+            for (col, value) in header.iter().enumerate() {
+                sheet.write_string(0, col as u16, *value).unwrap();
+            }
+            for (row_index, row) in rows.iter().enumerate() {
+                for (col, value) in row.iter().enumerate() {
+                    sheet
+                        .write_string((1 + row_index) as u32, col as u16, value.as_str())
+                        .unwrap();
+                }
+            }
+        }
+        workbook.save(path).unwrap();
+    }
+
+    const APPLIANCE_HEADER: [&str; 19] = [
+        "拨付批次",
+        "交易参考号",
+        "商户订单号",
+        "交易订单号",
+        "销售企业名称",
+        "核销商编",
+        "其他支付",
+        "销售金额",
+        "实收销售金额",
+        "补贴金额",
+        "补贴比例",
+        "SN码",
+        "所在地区",
+        "商品编码",
+        "能耗等级",
+        "编码品类",
+        "商品名称",
+        "发票号",
+        "ID",
+    ];
+
+    /// 按`APPLIANCE_HEADER`顺序生成一行；`label`写入拨付批次，便于测试用它识别行。
+    fn appliance_row<'a>(
+        label: &'a str,
+        merchant_order_no: &'a str,
+        transaction_order_no: &'a str,
+        subsidy: &'a str,
+    ) -> Vec<String> {
+        vec![
+            label.to_string(),
+            String::new(),
+            merchant_order_no.to_string(),
+            transaction_order_no.to_string(),
+            "企业甲".to_string(),
+            "COMP001".to_string(),
+            "0.00".to_string(),
+            "100.00".to_string(),
+            "90.00".to_string(),
+            subsidy.to_string(),
+            "0.15".to_string(),
+            "SN001".to_string(),
+            "地区甲".to_string(),
+            "CODE001".to_string(),
+            "一级".to_string(),
+            "品类甲".to_string(),
+            "商品甲".to_string(),
+            "INV001".to_string(),
+            "ID001".to_string(),
+        ]
+    }
+
+    fn label_of(row: &Row) -> &str {
+        match &row.values[0] {
+            Value::Text(text) => text.as_str(),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn matches_filename_requires_four_digit_year_prefix() {
+        assert!(matches_filename(
+            "2026年以旧换新补贴明细.xlsx",
+            "年以旧换新补贴明细.xlsx"
+        ));
+        assert!(!matches_filename(
+            "26年以旧换新补贴明细.xlsx",
+            "年以旧换新补贴明细.xlsx"
+        ));
+        assert!(!matches_filename(
+            "2026年数码补贴明细.xlsx",
+            "年以旧换新补贴明细.xlsx"
+        ));
+    }
+
+    #[test]
+    fn merges_batches_with_synonym_headers_and_excludes_summary_sheet() {
+        let dir = unique_temp_path("refund-appliance-happy-path");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 第一批次用“销方名称”，第二批次用“销售企业名称”——同义字段必须都能映射。
+        let mut header_batch1 = APPLIANCE_HEADER;
+        header_batch1[4] = "销方名称";
+
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[
+                (
+                    "批次一",
+                    &header_batch1,
+                    &[appliance_row("R1", "M1", "T1", "10.00")],
+                ),
+                (
+                    "批次二",
+                    &APPLIANCE_HEADER,
+                    &[appliance_row("R2", "M2", "T2", "20.00")],
+                ),
+                ("汇总", &["其他列"], &[vec!["不应被读取".to_string()]]),
+            ],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+
+        assert_eq!(table.columns.len(), 21);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(label_of(&table.rows[0]), "R1");
+        assert_eq!(label_of(&table.rows[1]), "R2");
+        // 退回原因、原拨付批次源表无对应字段，留空。
+        assert_eq!(table.rows[0].values[19], Value::Empty);
+        assert_eq!(table.rows[0].values[20], Value::Empty);
+        // 销方名称已统一映射为销售企业名称的值。
+        assert_eq!(table.rows[0].values[4], Value::Text("企业甲".to_string()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn excel_error_value_in_text_field_is_preserved_instead_of_erroring() {
+        let dir = unique_temp_path("refund-na-preserved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026年以旧换新补贴明细.xlsx");
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("批次一").unwrap();
+        for (col, header) in APPLIANCE_HEADER.iter().enumerate() {
+            sheet.write_string(0, col as u16, *header).unwrap();
+        }
+        let row = appliance_row("R1", "M1", "T1", "10.00");
+        for (col, value) in row.iter().enumerate() {
+            sheet.write_string(1, col as u16, value.as_str()).unwrap();
+        }
+        // 核销商编（第 6 列，0 基列号 5）：真实数据中出现过的查找失败错误值。
+        sheet
+            .write_formula(1, 5, Formula::new("=NA()").set_result("#N/A"))
+            .unwrap();
+        workbook.save(&path).unwrap();
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[5], Value::Text("#N/A".to_string()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_required_field() {
+        let dir = unique_temp_path("refund-missing-field");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut header = APPLIANCE_HEADER.to_vec();
+        header.pop(); // 去掉 ID
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次一",
+                &header,
+                &[appliance_row("R1", "M1", "T1", "10.00")
+                    .into_iter()
+                    .take(header.len())
+                    .collect()],
+            )],
+        );
+
+        let error = REFUND_APPLIANCE.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::Structure { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_subsidy_amount() {
+        let dir = unique_temp_path("refund-empty-subsidy");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次一",
+                &APPLIANCE_HEADER,
+                &[appliance_row("R1", "M1", "T1", "")],
+            )],
+        );
+
+        let error = REFUND_APPLIANCE.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::Data { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn groups_across_sheets_sinks_by_subsidy_total_and_isolates_field_types() {
+        let dir = unique_temp_path("refund-grouping");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[
+                (
+                    "批次一",
+                    &APPLIANCE_HEADER,
+                    &[
+                        appliance_row("A", "", "DUP1", "10.00"),
+                        appliance_row("B", "", "DUP1", "-20.00"), // 组内合计 -10 <= 0，全部沉底
+                        appliance_row("C", "", "DUP2", "30.00"),
+                    ],
+                ),
+                (
+                    "批次二",
+                    &APPLIANCE_HEADER,
+                    &[
+                        appliance_row("D", "", "DUP2", "40.00"), // 跨批次同组，合计 70 > 0，保留最后一次（D）
+                        appliance_row("E", "UNIQUE1", "", "5.00"), // 单条记录不受影响
+                        appliance_row("F", "", "CROSS", "1.00"), // 交易订单号=CROSS
+                        appliance_row("G", "CROSS", "", "1.00"), // 商户订单号=CROSS，字段类型不同，不得与 F 同组
+                    ],
+                ),
+            ],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 7);
+
+        let labels: Vec<&str> = table.rows.iter().map(label_of).collect();
+        assert_eq!(labels, vec!["D", "E", "F", "G", "A", "B", "C"]);
+
+        for label in ["D", "E", "F", "G"] {
+            let row = table.rows.iter().find(|r| label_of(r) == label).unwrap();
+            assert_eq!(row.fill, None, "{label} 不应沉底");
+        }
+        for label in ["A", "B", "C"] {
+            let row = table.rows.iter().find(|r| label_of(r) == label).unwrap();
+            assert_eq!(row.fill, Some(Fill::Pink), "{label} 应沉底");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parses_ratio_from_percent_text() {
+        let dir = unique_temp_path("refund-ratio-percent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut row = appliance_row("R1", "M1", "T1", "10.00");
+        row[10] = "15%".to_string();
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[("批次一", &APPLIANCE_HEADER, &[row])],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        match table.rows[0].values[10] {
+            Value::Ratio(ratio) => assert_eq!(ratio, "0.15".parse().unwrap()),
+            _ => panic!("expected ratio"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn other_payment_dash_allowed_only_for_digital() {
+        let appliance_dir = unique_temp_path("refund-dash-appliance");
+        std::fs::create_dir_all(&appliance_dir).unwrap();
+        let mut row = appliance_row("R1", "M1", "T1", "10.00");
+        row[6] = "-".to_string();
+        write_workbook(
+            &appliance_dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[("批次一", &APPLIANCE_HEADER, &[row])],
+        );
+        let error = REFUND_APPLIANCE.run(&appliance_dir).unwrap_err();
+        assert!(matches!(error, ProcessError::Data { .. }));
+        std::fs::remove_dir_all(&appliance_dir).unwrap();
+
+        let digital_header: [&str; 14] = [
+            "拨付批次",
+            "参考号",
+            "商户订单号",
+            "销售企业名称",
+            "核销商编",
+            "其他支付",
+            "销售金额",
+            "补贴金额",
+            "SN码",
+            "所在地区",
+            "商品编码",
+            "编码品类",
+            "商品名称",
+            "发票号",
+        ];
+        let digital_row = vec![
+            "R1".to_string(),
+            "REF1".to_string(),
+            "M1".to_string(),
+            "企业甲".to_string(),
+            "COMP001".to_string(),
+            "-".to_string(),
+            "100.00".to_string(),
+            "10.00".to_string(),
+            "SN001".to_string(),
+            "地区甲".to_string(),
+            "CODE001".to_string(),
+            "品类甲".to_string(),
+            "商品甲".to_string(),
+            "INV001".to_string(),
+        ];
+        let digital_dir = unique_temp_path("refund-dash-digital");
+        std::fs::create_dir_all(&digital_dir).unwrap();
+        write_workbook(
+            &digital_dir.join("2026年数码补贴明细.xlsx"),
+            &[("批次一", &digital_header, &[digital_row])],
+        );
+        let table = REFUND_DIGITAL.run(&digital_dir).unwrap();
+        // 数码允许“其他支付”保留文本“-”，不得改写为 0 或空值。
+        assert_eq!(
+            table.rows[0].values[OTHER_PAYMENT],
+            Value::Text("-".to_string())
+        );
+        std::fs::remove_dir_all(&digital_dir).unwrap();
+    }
+
+    #[test]
+    fn selects_latest_year_and_ignores_earlier_files() {
+        let dir = unique_temp_path("refund-multiple-years");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_workbook(
+            &dir.join("2025年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次一",
+                &APPLIANCE_HEADER,
+                &[appliance_row("OLD", "M1", "T1", "10.00")],
+            )],
+        );
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次一",
+                &APPLIANCE_HEADER,
+                &[appliance_row("NEW", "M2", "T2", "10.00")],
+            )],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(label_of(&table.rows[0]), "NEW");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_no_input_when_nothing_matches() {
+        let dir = unique_temp_path("refund-no-input");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let error = REFUND_APPLIANCE.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::NoInput { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
