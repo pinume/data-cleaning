@@ -50,7 +50,7 @@ data-cleaning/
 │   └── utils/                 # 无状态的通用工具
 │       ├── mod.rs
 │       ├── dates.rs           # Excel 序列值、yyyymmdd、文本日期解析与格式化
-│       ├── numbers.rs         # Decimal 金额、两位小数、浮点尾差判断
+│       ├── numbers.rs         # 两位小数、浮点尾差判断（to_cents）
 │       ├── text.rs            # 空值判断、标识字段转文本、字符边界检查
 │       ├── natural_sort.rs    # 文件名自然排序
 │       └── doc_no.rs          # yymmdd+单据号 拼接、去“收款”前缀
@@ -70,7 +70,7 @@ data-cleaning/
 | `main.rs` | 调用`app::cli::run()`，出错时打印到标准错误并以状态码1退出 | 不含任何业务逻辑 |
 | `lib.rs` | 声明`app`、`model`、`io`、`jobs`、`utils` | 集成测试只能通过这里访问内部模块 |
 | `app::cli` | 用`println!`与`stdin().read_line()`完成路径输入与菜单选择；执行完成后或`read_line()`返回0时正常退出 | 不含清洗规则，不直接写文件 |
-| `app::runner` | 按编号查找任务并执行；空输入时依次执行1–9，用`catch_unwind`隔离单个任务的panic，汇总各类别结果 | 一次只发布一个类别的结果；错误交给`cli`显示 |
+| `app::runner` | 按编号查找任务并执行；空输入时依次执行1–9，用`catch_unwind`隔离单个任务的panic，汇总各类别结果 | 一次只发布一个类别的结果；自行用`println!`打印各类别结果，不回传给`cli` |
 | `model::*` | 定义错误、单元格值、列定义、行、表和填色 | 不依赖`io`、`jobs` |
 | `io::paths` | 解析用户路径（去首尾空白与成对引号），校验存在、是目录、可读；只列出直接子级`.xlsx`，排除`~$`；计算输出目录与文件名 | 不递归，不修改源目录 |
 | `io::xlsx_reader` | 打开工作簿，枚举工作表，提供按绝对行列号访问的`SheetGrid` | 只负责读取，不做业务判断 |
@@ -90,6 +90,8 @@ pub mod io;
 pub mod jobs;
 pub mod model;
 pub mod utils;
+#[cfg(test)]
+mod test_support;
 
 // src/main.rs
 fn main() {
@@ -169,7 +171,7 @@ pub trait Job {
     fn run(&self, input_dir: &Path) -> Result<Table, ProcessError>;
 }
 
-pub fn registry() -> Vec<Box<dyn Job>>;       // 按编号 1–9 排列
+pub fn registry() -> &'static [&'static (dyn Job + Sync)]; // 按编号 1–9 排列
 
 // 跨文件复用的“按某字段值查唯一命中候选”工具：coupons.rs（10.10/10.12.1/10.12.2 节）
 // 与 uploaded.rs（5.7 节）共用同一套“先剔除空值、同级内去重、歧义即停不降级”判定。
@@ -183,7 +185,7 @@ pub(crate) fn unique_hit(index: &MultiValueIndex, key: &str) -> Option<String>;
 - `uploaded.rs`用配置结构体区分菜单3、4，合并各自的58列源数据；前25列按位置读取，第26列起按字段名称查找，支持第5.1节的“电脑”工作表变体。
 - 处理明细前，按`config.category`调用对应的`RefundJob::run()`完成回款校验（菜单3↔`REFUND_DIGITAL`，菜单4↔`REFUND_APPLIANCE`）。排除`fill == Some(Fill::Pink)`的沉底记录，按`订单号`→`检索参考号`→`发票号码`建立`MultiValueIndex`。
 - 每行先经`normalize_status()`归并`状态`，再用`jobs/mod.rs`的`resolve_via`/`PriorityOutcome`逐级匹配。唯一命中时覆盖为`已回款`并取回款`补贴金额`；未命中（含歧义）时保留归并后的状态，按`交易金额 × 15%`估算并保留两位小数，家电电脑封顶`1500.00`元、数码封顶`500.00`元；交易金额缺失或非数值时金额留空。结果统一追加为第59列，详见project.md第5.7节。
-- `refund.rs`用配置结构体区分菜单6、7（文件名模式、同义字段表、基础字段、分组优先级、`其他支付`是否允许`-`、输出基名），共用合并与沉底逻辑；`OUTPUT_FIELDS`为`pub(crate)`，供`uploaded.rs`按列位置索引匹配字段。
+- `refund.rs`用配置结构体区分菜单6、7（文件名模式、同义字段表、基础字段、分组优先级、`其他支付`是否允许`-`、输出基名、`核销商编`过滤目标商户号），共用合并与沉底逻辑；读取阶段先按`核销商编`精确匹配该商户号过滤明细行，不匹配的行不进入后续校验、合并或沉底（project.md第7.1/8.1节）。`OUTPUT_FIELDS`为`pub(crate)`，供`uploaded.rs`按列位置索引匹配字段。
 - 第一版不拆`uploaded/`、`refund/`子目录；代码量明显难以维护时再拆。
 
 `unionpay.rs`分为两层接口：
@@ -213,7 +215,7 @@ let records = unionpay::load_records(input_dir)?;
 let valid_refs: HashSet<String> = records
     .iter()
     .map(|r| r.retrieval_no.as_str())          // 源字段“检索号”
-    .filter(|v| is_ref_no(v))                  // ^[0-9]{11}N$
+    .filter(|v| is_valid_ref_no(v))             // ^[0-9]{11}N$
     .map(str::to_owned)
     .collect();
 
@@ -230,8 +232,8 @@ let digital = uploaded::UPLOADED_DIGITAL.run(input_dir)?;
 // 两组合并后按“检索参考号”“发票号码”（第7、20列）分别建索引；备注第一阶段未命中时，
 // 参考号（主键）优先于数电发票号码（次键）查“状态”（第9列），10.12.2 节的两级优先级。
 
-// 两阶段都未命中（Option<String> 为 None）时，remark 固定为“未上传”文本；沉底/填色只看
-// 是否实际命中（即那个 Option 而非最终文本是否为空），10.12.3/10.12.4 节。
+// 两阶段都未命中时，remark 固定为“未上传”文本（10.12.3 节）；
+// 仅第一阶段实际命中的记录沉底并整行填充粉色，第二阶段及未命中记录在前且不填色（10.12.4 节）。
 ```
 
 ### 3.4 读取接口
@@ -345,7 +347,7 @@ main.rs → app::cli → app::runner
 
 ### 6.1 发布
 
-1. 在输出目录写入`.<基名>.<随机后缀>.xlsx.tmp`。
+1. 在输出目录写入`.<基名>.<进程ID>.<纳秒时间戳十六进制>.xlsx.tmp`。
 2. 确认临时文件存在且非空。
 3. 若正式文件已存在，先重命名为`.bak`备份。
 4. 将临时文件重命名为正式文件名。
@@ -356,13 +358,13 @@ main.rs → app::cli → app::runner
 
 ### 6.2 文本与正则
 
-- `regex`不支持环视。project.md第3.4节“单据号不得吞入后续文字”和第10.6节“不得从更长数字串中截取”，统一用`utils::text`中的边界检查函数：先匹配候选，再检查匹配前后字符是否为数字或ASCII字母。
+- `regex`不支持环视。project.md第10.6节“不得从更长数字串中截取”，用`utils::text::has_isolated_boundaries`：先匹配候选，再检查匹配前后字符是否为数字或ASCII字母；该函数只被`coupons.rs`使用。第3.4节“单据号不得吞入后续文字”由`invoice.rs`的标签正则自身的字符类边界（`[A-Za-z]*[0-9]+`，遇非字母数字即止）保证，不调用`utils::text`。
 - 字段名比较使用完整字符串相等，不做大小写或空白归一化，除非project.md另有规定。
 - 判断空值时，空单元格、空字符串和纯空白都视为空，但输出时保留原值。
 
 ### 6.3 数值
 
-- 金额与比例全程使用`rust_decimal::Decimal`。从`f64`转换时使用最短往返表示，避免引入新的二进制误差。
+- 金额与比例全程使用`rust_decimal::Decimal`。从`f64`转换时直接使用`Decimal::from_f64`（最短往返表示），避免引入新的二进制误差。
 - `utils::numbers::to_cents(value)`实现第10.7节的尾差规则：与最近两位小数的差不超过`0.000001`时返回该值，否则返回错误。
 - 写入XLSX时把`Decimal`转换为数值单元格并套用列格式（`Decimal(Two)`固定两位小数，`Decimal(Original)`按原精度，绝不使用科学计数法）。
 

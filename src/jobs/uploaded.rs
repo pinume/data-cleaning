@@ -556,28 +556,9 @@ impl Job for UploadedJob {
     }
 }
 
-/// 文件名须完整符合`MER_<商户号>_yyyymmddhhmmss_yjhx.xlsx`。
+/// 文件名须匹配`MER_<商户号>_*.xlsx`。
 fn matches_filename(name: &str, merchant_no: &str) -> bool {
-    let Some(stem) = name
-        .strip_prefix("MER_")
-        .and_then(|s| s.strip_suffix(".xlsx"))
-    else {
-        return false;
-    };
-    let Some(rest) = stem
-        .strip_prefix(merchant_no)
-        .and_then(|s| s.strip_prefix('_'))
-    else {
-        return false;
-    };
-    match rest.split_once('_') {
-        Some((timestamp, suffix)) => {
-            timestamp.len() == 14
-                && timestamp.bytes().all(|b| b.is_ascii_digit())
-                && suffix == "yjhx"
-        }
-        None => false,
-    }
+    name.starts_with(&format!("MER_{merchant_no}_")) && name.ends_with(".xlsx")
 }
 
 /// 在“第26列起”的范围内按名称查找某统一字段的实际列号：候选同义词中恰好一个出现时
@@ -844,7 +825,7 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
     files.sort();
     if files.is_empty() {
         return Err(ProcessError::NoInput {
-            pattern: format!("MER_{}_yyyymmddhhmmss_yjhx.xlsx", config.merchant_no),
+            pattern: format!("MER_{}_*.xlsx", config.merchant_no),
         });
     }
 
@@ -994,7 +975,7 @@ mod tests {
                 merchant_order,
                 "",
                 "企业甲",
-                "COMP001",
+                "89813015722APT1",
                 "0.00",
                 "100.00",
                 "90.00",
@@ -1032,7 +1013,7 @@ mod tests {
                 reference,
                 merchant_order,
                 "企业乙",
-                "COMP002",
+                "89813014812B06R",
                 "100.00",
                 subsidy,
                 "SN002",
@@ -1204,9 +1185,13 @@ mod tests {
     }
 
     #[test]
-    fn matches_filename_checks_merchant_timestamp_and_suffix() {
+    fn matches_filename_checks_merchant_prefix_and_extension() {
         assert!(matches_filename(
             "MER_89813014812B06R_20260914101809_yjhx.xlsx",
+            "89813014812B06R"
+        ));
+        assert!(matches_filename(
+            "MER_89813014812B06R_anything.xlsx",
             "89813014812B06R"
         ));
         assert!(!matches_filename(
@@ -1214,11 +1199,7 @@ mod tests {
             "89813014812B06R"
         ));
         assert!(!matches_filename(
-            "MER_89813014812B06R_2026_yjhx.xlsx",
-            "89813014812B06R"
-        ));
-        assert!(!matches_filename(
-            "MER_89813014812B06R_20260914101809_other.xlsx",
+            "MER_89813014812B06R_20260914101809_yjhx.xls",
             "89813014812B06R"
         ));
     }
@@ -1745,7 +1726,7 @@ mod tests {
                 "ORDER-E",
                 "TXN-1",
                 "企业甲",
-                "COMP001",
+                "89813015722APT1",
                 "0.00",
                 "100.00",
                 "90.00",
@@ -1766,7 +1747,7 @@ mod tests {
                 "ORDER-E",
                 "TXN-2",
                 "企业甲",
-                "COMP001",
+                "89813015722APT1",
                 "0.00",
                 "100.00",
                 "90.00",
@@ -1787,7 +1768,7 @@ mod tests {
                 "NOMATCH-ORDER",
                 "TXN-3",
                 "企业甲",
-                "COMP001",
+                "89813015722APT1",
                 "0.00",
                 "100.00",
                 "90.00",

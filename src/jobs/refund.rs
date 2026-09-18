@@ -70,6 +70,7 @@ const COLUMN_TYPES: [ColumnType; 24] = [
 const OTHER_PAYMENT: usize = 7;
 const SUBSIDY_AMOUNT: usize = 10;
 const RATIO: usize = 11;
+const DEALER_CODE: usize = 6; // 核销商编
 
 struct RefundConfig {
     category: Category,
@@ -85,6 +86,9 @@ struct RefundConfig {
     grouping_priority: [usize; 3],
     /// 是否允许"其他支付"保留文本`-`（数码回款明细特有）。
     allow_dash_other_payment: bool,
+    /// 只保留`核销商编`精确等于该值的明细行，其余门店编码的记录在读取阶段即排除，
+    /// 不参与后续合并、去重或输出。
+    dealer_code: &'static str,
 }
 
 const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
@@ -127,6 +131,7 @@ const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
     required_indices: &APPLIANCE_REQUIRED,
     grouping_priority: [4, 3, 19], // 交易订单号 → 商户订单号 → 发票号
     allow_dash_other_payment: false,
+    dealer_code: "89813015722APT1",
 };
 
 const DIGITAL_SYNONYMS: [&[&str]; 24] = [
@@ -167,6 +172,7 @@ const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     required_indices: &DIGITAL_REQUIRED,
     grouping_priority: [2, 3, 19], // 交易参考号 → 商户订单号 → 发票号
     allow_dash_other_payment: true,
+    dealer_code: "89813014812B06R",
 };
 
 pub struct RefundJob(&'static RefundConfig);
@@ -256,7 +262,8 @@ fn read_other_payment(cell: &RawCell, allow_dash: bool) -> Result<Value, String>
 }
 
 /// 文本字段：与共享的`cell_text`相比，遇到 Excel 错误值（如`#N/A`）时原样保留为文本，
-/// 不终止处理——已确认：源表中的错误值（如查找表未匹配的核销商编）按原样输出，不做推断。
+/// 不终止处理——已确认：源表文本字段可能出现查找失败等错误值，按原样输出，不做推断。
+/// `核销商编`已在读取阶段按商户号过滤为匹配值，不会经此路径遇到错误值。
 fn cell_text_tolerant(cell: &RawCell) -> Result<String, String> {
     match cell {
         RawCell::Error(_) => Ok(cell_display(cell)),
@@ -478,8 +485,12 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
             });
         }
 
+        let dealer_col = columns[DEALER_CODE].expect("核销商编在 required_indices 中");
         let last_row = sheet.last_value_row().unwrap_or(1);
         for row in 2..=last_row {
+            if cell_display(&sheet.cell(row, dealer_col)).trim() != config.dealer_code {
+                continue;
+            }
             records.push(read_row(
                 sheet,
                 row,
@@ -561,7 +572,7 @@ mod tests {
             merchant_order_no.to_string(),
             transaction_order_no.to_string(),
             "企业甲".to_string(),
-            "COMP001".to_string(),
+            APPLIANCE_CONFIG.dealer_code.to_string(),
             "0.00".to_string(),
             "100.00".to_string(),
             "90.00".to_string(),
@@ -691,6 +702,31 @@ mod tests {
     }
 
     #[test]
+    fn drops_rows_whose_dealer_code_does_not_match_configured_merchant() {
+        let dir = unique_temp_path("refund-dealer-code-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut other_dealer_row = appliance_row("OTHER", "M2", "T2", "20.00");
+        other_dealer_row[5] = "89813015722APOTHER".to_string();
+
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次一",
+                &APPLIANCE_HEADER,
+                &[appliance_row("KEEP", "M1", "T1", "10.00"), other_dealer_row],
+            )],
+        );
+
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(label_of(&table.rows[0]), "KEEP");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn excel_error_value_in_text_field_is_preserved_instead_of_erroring() {
         let dir = unique_temp_path("refund-na-preserved");
         std::fs::create_dir_all(&dir).unwrap();
@@ -706,14 +742,15 @@ mod tests {
         for (col, value) in row.iter().enumerate() {
             sheet.write_string(1, col as u16, value.as_str()).unwrap();
         }
-        // 核销商编（第 6 列，0 基列号 5）：真实数据中出现过的查找失败错误值。
+        // 所在地区（第 13 列，0 基列号 12）：真实数据中曾在文本字段出现过的查找失败错误值；
+        // 核销商编本身已由商户号过滤保证为匹配值，不会是错误值，故用其他文本字段验证容错。
         sheet
-            .write_formula(1, 5, Formula::new("=NA()").set_result("#N/A"))
+            .write_formula(1, 12, Formula::new("=NA()").set_result("#N/A"))
             .unwrap();
         workbook.save(&path).unwrap();
 
         let table = REFUND_APPLIANCE.run(&dir).unwrap();
-        assert_eq!(table.rows[0].values[6], Value::Text("#N/A".to_string()));
+        assert_eq!(table.rows[0].values[13], Value::Text("#N/A".to_string()));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -864,7 +901,7 @@ mod tests {
             "REF1".to_string(),
             "M1".to_string(),
             "企业甲".to_string(),
-            "COMP001".to_string(),
+            DIGITAL_CONFIG.dealer_code.to_string(),
             "-".to_string(),
             "100.00".to_string(),
             "10.00".to_string(),

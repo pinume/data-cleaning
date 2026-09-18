@@ -8,7 +8,11 @@ fn normalize_raw_path(raw: &str) -> String {
     let unquoted = trimmed
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
         .unwrap_or(trimmed);
     unquoted.trim().to_string()
 }

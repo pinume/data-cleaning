@@ -1438,17 +1438,29 @@ mod tests {
         assert_eq!(table.rows.len(), 3);
 
         // 前部：第二行（第二阶段命中）与第三行（未命中），保持在顶部且无填色
-        assert_eq!(table.rows[0].values[0], Value::Text("收款ZFFX000002".to_string()));
+        assert_eq!(
+            table.rows[0].values[0],
+            Value::Text("收款ZFFX000002".to_string())
+        );
         assert_eq!(table.rows[0].values[10], Value::Text("已上传".to_string()));
         assert_eq!(table.rows[0].fill, None);
 
-        assert_eq!(table.rows[1].values[0], Value::Text("收款ZFFX000003".to_string()));
+        assert_eq!(
+            table.rows[1].values[0],
+            Value::Text("收款ZFFX000003".to_string())
+        );
         assert_eq!(table.rows[1].values[10], Value::Text("未上传".to_string()));
         assert_eq!(table.rows[1].fill, None);
 
         // 底部：第一行（第一阶段命中），填粉色并沉底
-        assert_eq!(table.rows[2].values[0], Value::Text("收款ZFFX000001".to_string()));
-        assert_eq!(table.rows[2].values[10], Value::Text("退货-退单".to_string()));
+        assert_eq!(
+            table.rows[2].values[0],
+            Value::Text("收款ZFFX000001".to_string())
+        );
+        assert_eq!(
+            table.rows[2].values[10],
+            Value::Text("退货-退单".to_string())
+        );
         assert_eq!(table.rows[2].fill, Some(Fill::Pink));
 
         std::fs::remove_dir_all(&dir).unwrap();
