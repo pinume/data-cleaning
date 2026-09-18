@@ -1,6 +1,6 @@
 # 项目目录架构
 
-本文规定Rust实现的目录结构、模块边界和关键类型；数据字段、筛选、排序与验收规则以[project.md](project.md)为准。项目处于开发准备阶段，下列模块是目标结构，不表示处理逻辑已实现。
+本文规定Rust实现的目录结构、模块边界和关键类型；数据字段、筛选、排序与验收规则以[project.md](project.md)为准。项目已完成全部核心模块开发，`cargo test`下115项自动化测试全部通过。下列模块为当前实现的架构规范。
 
 ## 1. 目录结构
 
@@ -15,10 +15,11 @@ data-cleaning/
 ├── src/
 │   ├── main.rs                # 程序入口，仅调用 app::cli::run()
 │   ├── lib.rs                 # 声明各模块，供 main.rs 与 tests/ 使用
+│   ├── test_support.rs        # 仅 src/ 内单元测试共用的辅助（唯一临时路径）
 │   │
 │   ├── app/                   # 交互与调度
 │   │   ├── mod.rs
-│   │   ├── cli.rs             # 路径输入、菜单显示、结果输出、菜单循环
+│   │   ├── cli.rs             # 路径输入、菜单显示、单次或批量执行调度后退出
 │   │   └── runner.rs          # 编号→任务映射；单类执行或 1–9 批量执行
 │   │
 │   ├── model/                 # 数据模型
@@ -55,16 +56,7 @@ data-cleaning/
 │       └── doc_no.rs          # yymmdd+单据号 拼接、去“收款”前缀
 │
 └── tests/
-    ├── common/
-    │   └── mod.rs             # 生成样本工作簿、读取输出等共用辅助函数
-    ├── invoice.rs
-    ├── union_subsidy.rs
-    ├── uploaded.rs
-    ├── unionpay.rs
-    ├── refund.rs
-    ├── receipts.rs
-    ├── coupons.rs
-    └── publishing.rs          # 发布、覆盖与失败恢复
+    └── publishing.rs          # 集成测试：发布、覆盖与失败恢复
 ```
 
 - 用户输入的源数据目录可以在项目目录内或外，名称不限，不属于上述固定结构。输出写到该源目录父目录下的`source_data/`（与源目录同级，不存在时自动创建）。
@@ -77,7 +69,7 @@ data-cleaning/
 |---|---|---|
 | `main.rs` | 调用`app::cli::run()`，出错时打印到标准错误并以状态码1退出 | 不含任何业务逻辑 |
 | `lib.rs` | 声明`app`、`model`、`io`、`jobs`、`utils` | 集成测试只能通过这里访问内部模块 |
-| `app::cli` | 用`println!`与`stdin().read_line()`完成路径输入、菜单选择与循环；`read_line()`返回0时正常退出 | 不含清洗规则，不直接写文件 |
+| `app::cli` | 用`println!`与`stdin().read_line()`完成路径输入与菜单选择；执行完成后或`read_line()`返回0时正常退出 | 不含清洗规则，不直接写文件 |
 | `app::runner` | 按编号查找任务并执行；空输入时依次执行1–9，用`catch_unwind`隔离单个任务的panic，汇总各类别结果 | 一次只发布一个类别的结果；错误交给`cli`显示 |
 | `model::*` | 定义错误、单元格值、列定义、行、表和填色 | 不依赖`io`、`jobs` |
 | `io::paths` | 解析用户路径（去首尾空白与成对引号），校验存在、是目录、可读；只列出直接子级`.xlsx`，排除`~$`；计算输出目录与文件名 | 不递归，不修改源目录 |
@@ -108,7 +100,7 @@ fn main() {
 }
 ```
 
-`cli::run()`返回`Result<(), ProcessError>`。各类别的处理失败在菜单循环内部显示并返回菜单，不会传到`main`；只有终端读写本身失败等无法继续交互的错误才向上返回。输入结束（`read_line()`返回0）时返回`Ok(())`。
+`cli::run()`返回`Result<(), ProcessError>`。单类或批量执行完成后显示结果并直接退出，不返回菜单；执行过程中的错误由`runner`捕获并打印，不会传到`main`；只有终端读写本身失败等无法继续交互的错误才向上返回。输入结束（`read_line()`返回0）时直接返回`Ok(())`正常退出。
 
 ### 3.2 结果表
 
@@ -225,7 +217,6 @@ impl SheetGrid {
     pub fn name(&self) -> &str;
     pub fn cell(&self, row: u32, col: u32) -> RawCell;  // Excel 行列号，从 1 开始
     pub fn last_value_row(&self) -> Option<u32>;        // 最后一个含实际值的行
-    pub fn last_value_col(&self) -> Option<u32>;
     pub fn row_texts(&self, row: u32) -> Vec<String>;   // 读取表头用
 }
 
@@ -318,7 +309,7 @@ main.rs → app::cli → app::runner
                    io::publisher（替换正式文件）
                          │
                          ▼
-          app::cli 显示结果或错误，返回菜单
+          app::cli 显示结果或错误，程序退出
 ```
 
 批量模式（空输入）下，`runner`依次执行1–9，每个类别独立完成“运行→写入→发布”，失败不影响后续类别，最后逐项报告成功或失败。
@@ -361,9 +352,9 @@ main.rs → app::cli → app::runner
 
 ## 7. 测试
 
-- **单元测试**：写在各模块的`#[cfg(test)] mod tests`中，覆盖日期解析、单据号纠正、尾差判断、自然排序、参考号修正等纯规则。
-- **集成测试**：`tests/`下每个文件对应一个类别，由`tests/common/mod.rs`用`rust_xlsxwriter`现场生成小样本工作簿（含开头空白行、合计行、同名列、`-`值等边界情况），运行任务后读取输出XLSX，检查字段、行数、顺序、类型及填色。无需提交二进制样本文件。
-- **发布测试**：`tests/publishing.rs`模拟目标文件已存在、写入中途失败、替换失败等情况，确认原结果可恢复。
+- **纯规则单元测试**：写在`src/utils/*`等模块的`#[cfg(test)] mod tests`中，覆盖日期解析、单据号纠正、尾差判断、自然排序、参考号修正等纯函数。
+- **业务规则与工作簿解析测试**：写在各`src/jobs/*.rs`的`#[cfg(test)] mod tests`中，用`rust_xlsxwriter`现场生成小样本工作簿（含开头空白行、合计行、同名列、`-`值等边界情况），运行任务后检查字段、行数、顺序、类型及填色。无需提交二进制样本文件。`src/test_support.rs`提供唯一临时路径等共用辅助。
+- **发布集成测试**：`tests/publishing.rs`模拟目标文件已存在、临时文件缺失或为空等情况，确认原结果可恢复。集成测试是独立编译单元，无法复用`src/test_support.rs`，各自保留所需的辅助函数。
 - **样本验收**：用项目根目录下的`data/`运行程序，按project.md各节“验收要求”核对当前数量与分布。此步骤不写入自动测试，因为样本数据不纳入版本控制。
 
 ## 8. 构建与运行
@@ -384,7 +375,7 @@ main.rs → app::cli → app::runner
 
 目录结构以本文第1节为基线，不再调整，直接进入实现：
 
-1. `Cargo.toml`、`rust-toolchain.toml`、`lib.rs`与`model`：数据模型、错误类型；随后完成`app`的菜单循环与路径校验。
+1. `Cargo.toml`、`rust-toolchain.toml`、`lib.rs`与`model`：数据模型、错误类型；随后完成`app`的交互提示、路径校验与执行退出逻辑。
 2. `io`：读取、XLSX写入与发布，完成`tests/publishing.rs`。
 3. `utils`：日期、金额、文本、自然排序、单据号工具及单元测试。
 4. `jobs`：按project.md第3–10节逐个实现。先完成`unionpay.rs`，因为`coupons.rs`依赖它。
