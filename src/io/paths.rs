@@ -57,23 +57,18 @@ pub fn resolve_input_dir(raw: &str) -> Result<PathBuf, ProcessError> {
 
 /// 列出`输入目录`直接包含的 `.xlsx` 文件，不递归，排除 `~$` 开头的临时文件。
 pub fn list_xlsx_files(dir: &Path) -> Result<Vec<PathBuf>, ProcessError> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.starts_with("~$") {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("xlsx") {
-            files.push(path);
-        }
-    }
+    let files = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| !name.starts_with("~$"))
+                && path.extension().is_some_and(|ext| ext == "xlsx")
+        })
+        .collect();
     Ok(files)
 }
 

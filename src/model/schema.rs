@@ -1,4 +1,4 @@
-/// 金额精度：区分“保留原精度”（第 4、5 节）与“固定两位小数”（第 6–8、10 节）。
+/// 金额精度：区分“保留原精度”（第 4 节、第 5 节交易金额）与“固定两位小数”（第 5 节补贴金额、第 6–8、10 节）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecimalScale {
     Original,

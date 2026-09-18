@@ -6,11 +6,11 @@ use chrono::NaiveDate;
 use regex::Regex;
 
 use crate::io::paths::list_xlsx_files;
-use crate::io::xlsx_reader::{RawCell, open_sheets};
+use crate::io::xlsx_reader::open_sheets;
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
 use crate::utils::{dates, doc_no};
 
-use super::{Category, Job, cell_display, cell_text, data_error, text_value};
+use super::{Category, Job, cell_display, cell_text, data_error, parse_datetime_field, text_value};
 
 pub(crate) const SOURCE_HEADERS: [&str; 30] = [
     "订单号",
@@ -125,10 +125,9 @@ fn select_latest_file(input_dir: &Path) -> Result<PathBuf, ProcessError> {
 
 /// 以最后一个半角星号为分隔符，仅保留星号后的商品名称；不含星号时保持不变。
 fn clean_product_name(raw: &str) -> String {
-    match raw.rfind('*') {
-        Some(position) => raw[position + 1..].to_string(),
-        None => raw.to_string(),
-    }
+    raw.rsplit_once('*')
+        .map_or(raw, |(_, name)| name)
+        .to_string()
 }
 
 /// project.md 3.4 节已确认的定向修正，作用于整条备注文本。
@@ -184,11 +183,9 @@ fn normalize_document_no(raw: &str) -> Option<String> {
     }
 }
 
-/// 按 3.4 节规则由备注信息生成`匹配单据号`；任一步骤不满足唯一确定的条件时返回`None`。
+/// 从备注文本中按正则提取唯一的销售日期与单据号，生成匹配单据号；
+/// 任一字段未命中或存在歧义（多个不同候选值）时返回`None`。
 fn build_match_doc_no(remark: &str) -> Option<String> {
-    if remark.trim().is_empty() {
-        return None;
-    }
     let fixed = apply_known_remark_fixes(remark);
 
     let mut dates_found = std::collections::HashSet::new();
@@ -214,48 +211,6 @@ fn build_match_doc_no(remark: &str) -> Option<String> {
     let normalized = normalize_document_no(stripped)?;
 
     Some(doc_no::build_match_doc_no(date, &normalized))
-}
-
-/// 开票时间：为空时保持为空；非空但无法识别时按数据异常终止。
-fn parse_issue_time(
-    cell: &RawCell,
-    file: &str,
-    sheet: &str,
-    row: u32,
-) -> Result<Value, ProcessError> {
-    match cell {
-        RawCell::Empty => Ok(Value::Empty),
-        RawCell::DateTime(serial) => dates::datetime_from_serial(*serial)
-            .map(Value::DateTime)
-            .ok_or_else(|| {
-                data_error(
-                    file,
-                    sheet,
-                    row,
-                    "开票时间",
-                    serial.to_string(),
-                    "无法解析为日期时间".to_string(),
-                )
-            }),
-        other => {
-            let text = cell_display(other);
-            if text.trim().is_empty() {
-                return Ok(Value::Empty);
-            }
-            dates::parse_date_text(&text)
-                .map(Value::DateTime)
-                .ok_or_else(|| {
-                    data_error(
-                        file,
-                        sheet,
-                        row,
-                        "开票时间",
-                        text.clone(),
-                        "无法解析为日期时间".to_string(),
-                    )
-                })
-        }
-    }
 }
 
 fn is_abnormal(record: &InvoiceRecord) -> bool {
@@ -315,7 +270,13 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
 
     let mut records = Vec::new();
     for row in 7..=last_row {
-        let issue_time = parse_issue_time(&sheet.cell(row, 3), &file_name, &sheet_name, row)?;
+        let issue_time = parse_datetime_field(
+            &sheet.cell(row, 3),
+            "开票时间",
+            &file_name,
+            &sheet_name,
+            row,
+        )?;
 
         let invoice_type = cell_text(&sheet.cell(row, 4)).map_err(|detail| {
             data_error(

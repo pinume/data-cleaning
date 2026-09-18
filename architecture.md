@@ -123,8 +123,8 @@ pub enum Value {
 
 // model/schema.rs
 pub enum DecimalScale {
-    Original,   // 保留原精度（第 4、5 节）
-    Two,        // 固定两位小数，XLSX 格式 0.00（第 6–8、10 节）
+    Original,   // 保留原精度（第 4 节、第 5 节交易金额）
+    Two,        // 固定两位小数，XLSX 格式 0.00（第 5 节补贴金额、第 6–8、10 节）
 }
 
 pub enum ColumnType {

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use calamine::{Data, Range, Reader, Xlsx, open_workbook};
@@ -15,6 +16,20 @@ pub enum RawCell {
     /// Excel 日期/时间序列值（未做 1900/1904 纪元换算），由`utils::dates`解析。
     DateTime(f64),
     Error(String),
+}
+
+impl fmt::Display for RawCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RawCell::Empty => Ok(()),
+            RawCell::Text(text) => write!(f, "{text}"),
+            RawCell::Float(value) => write!(f, "{value}"),
+            RawCell::Int(value) => write!(f, "{value}"),
+            RawCell::Bool(value) => write!(f, "{value}"),
+            RawCell::DateTime(serial) => write!(f, "{serial}"),
+            RawCell::Error(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 impl From<&Data> for RawCell {
@@ -80,6 +95,14 @@ impl SheetGrid {
                 RawCell::Empty | RawCell::DateTime(_) | RawCell::Error(_) => String::new(),
             })
             .collect()
+    }
+
+    /// 计算指定行范围内的内容指纹（表头+明细），用于检测不同文件是否为完全相同的重复导出。
+    pub fn fingerprint(&self, start_row: u32, end_row: u32) -> String {
+        (start_row..=end_row)
+            .map(|row| self.row_texts(row).join("\u{1}"))
+            .collect::<Vec<_>>()
+            .join("\u{2}")
     }
 }
 

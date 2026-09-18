@@ -9,7 +9,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, amount_value, cell_amount, cell_display, cell_text, data_error, text_value,
+    Category, Job, amount_value, cell_amount, cell_display, cell_text, data_error,
+    resolve_synonym_column, text_value,
 };
 
 pub(crate) const OUTPUT_FIELDS: [&str; 24] = [
@@ -203,22 +204,6 @@ fn matches_filename(name: &str, suffix: &str) -> bool {
     match name.strip_suffix(suffix) {
         Some(year) => year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()),
         None => false,
-    }
-}
-
-/// 在表头中查找某统一字段的实际列号：候选同义词中恰好一个出现时返回该列号；
-/// 均未出现时返回`None`（该字段在此工作表缺失）；多个同义词同时出现视为结构异常。
-fn resolve_synonym_column(header: &[String], synonyms: &[&str]) -> Result<Option<u32>, String> {
-    let mut found = Vec::new();
-    for &synonym in synonyms {
-        if let Some(position) = header.iter().position(|name| name == synonym) {
-            found.push(position as u32 + 1);
-        }
-    }
-    match found.as_slice() {
-        [] => Ok(None),
-        [column] => Ok(Some(*column)),
-        _ => Err(format!("字段候选名称 {synonyms:?} 在表头中出现多个匹配")),
     }
 }
 

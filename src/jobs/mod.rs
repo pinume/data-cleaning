@@ -30,15 +30,7 @@ pub trait Job {
 
 /// 单元格的通用文本表示，仅用于错误报告与重复导出指纹等诊断用途，不代表最终输出值。
 pub(crate) fn cell_display(cell: &RawCell) -> String {
-    match cell {
-        RawCell::Empty => String::new(),
-        RawCell::Text(text) => text.clone(),
-        RawCell::Int(n) => n.to_string(),
-        RawCell::Float(f) => f.to_string(),
-        RawCell::Bool(b) => b.to_string(),
-        RawCell::DateTime(serial) => serial.to_string(),
-        RawCell::Error(message) => message.clone(),
-    }
+    cell.to_string()
 }
 
 /// 文本字段：保留原值（包括纯空白），仅数值型单元格需还原为完整整数文本。
@@ -84,7 +76,7 @@ pub(crate) fn cell_amount(cell: &RawCell) -> Result<Option<Decimal>, String> {
         RawCell::Float(f) => Decimal::from_f64(*f)
             .map(Some)
             .ok_or_else(|| format!("数值 {f} 无法转换为十进制金额")),
-        other => Err(format!("金额字段出现非数值内容：{}", cell_display(other))),
+        other => Err(format!("金额字段出现非数值内容：{other}")),
     }
 }
 
@@ -93,9 +85,9 @@ pub(crate) fn cell_amount(cell: &RawCell) -> Result<Option<Decimal>, String> {
 pub(crate) fn cell_date_or_text(cell: &RawCell) -> Value {
     if let RawCell::DateTime(serial) = cell {
         return dates::date_from_serial(*serial)
-            .map_or_else(|| Value::Text(cell_display(cell)), Value::Date);
+            .map_or_else(|| Value::Text(cell.to_string()), Value::Date);
     }
-    let text = cell_display(cell);
+    let text = cell.to_string();
     if text.trim().is_empty() {
         return Value::Empty;
     }
@@ -106,9 +98,9 @@ pub(crate) fn cell_date_or_text(cell: &RawCell) -> Value {
 pub(crate) fn cell_datetime_or_text(cell: &RawCell) -> Value {
     if let RawCell::DateTime(serial) = cell {
         return dates::datetime_from_serial(*serial)
-            .map_or_else(|| Value::Text(cell_display(cell)), Value::DateTime);
+            .map_or_else(|| Value::Text(cell.to_string()), Value::DateTime);
     }
-    let text = cell_display(cell);
+    let text = cell.to_string();
     if text.trim().is_empty() {
         return Value::Empty;
     }
@@ -134,8 +126,7 @@ pub(crate) fn data_error(
     }
 }
 
-/// 日期字段：为空时保持为空；非空但无法识别时按数据异常终止（无“保留原值”豁免的场景，
-/// 与`cell_date_or_text`的第 5、6 节豁免相对）。
+/// 日期字段：为空时保持为空；非空但无法识别时按数据异常终止。
 pub(crate) fn parse_date_field(
     cell: &RawCell,
     field: &str,
@@ -158,23 +149,114 @@ pub(crate) fn parse_date_field(
                 )
             }),
         other => {
-            let text = cell_display(other);
+            let text = other.to_string();
             if text.trim().is_empty() {
                 return Ok(Value::Empty);
             }
             dates::parse_date_text(&text)
                 .map(|dt| Value::Date(dt.date()))
                 .ok_or_else(|| {
+                    data_error(file, sheet, row, field, text, "无法解析为日期".to_string())
+                })
+        }
+    }
+}
+
+/// 日期时间字段：为空时保持为空；非空但无法识别时按数据异常终止。
+pub(crate) fn parse_datetime_field(
+    cell: &RawCell,
+    field: &str,
+    file: &str,
+    sheet: &str,
+    row: u32,
+) -> Result<Value, ProcessError> {
+    match cell {
+        RawCell::Empty => Ok(Value::Empty),
+        RawCell::DateTime(serial) => dates::datetime_from_serial(*serial)
+            .map(Value::DateTime)
+            .ok_or_else(|| {
+                data_error(
+                    file,
+                    sheet,
+                    row,
+                    field,
+                    serial.to_string(),
+                    "无法解析为日期时间".to_string(),
+                )
+            }),
+        other => {
+            let text = other.to_string();
+            if text.trim().is_empty() {
+                return Ok(Value::Empty);
+            }
+            dates::parse_date_text(&text)
+                .map(Value::DateTime)
+                .ok_or_else(|| {
                     data_error(
                         file,
                         sheet,
                         row,
                         field,
-                        text.clone(),
-                        "无法解析为日期".to_string(),
+                        text,
+                        "无法解析为日期时间".to_string(),
                     )
                 })
         }
+    }
+}
+
+/// 时间字段：为空时保持为空；非空但无法识别时按数据异常终止。
+pub(crate) fn parse_time_field(
+    cell: &RawCell,
+    field: &str,
+    file: &str,
+    sheet: &str,
+    row: u32,
+) -> Result<Value, ProcessError> {
+    match cell {
+        RawCell::Empty => Ok(Value::Empty),
+        RawCell::DateTime(serial) => dates::time_from_serial(*serial)
+            .map(Value::Time)
+            .ok_or_else(|| {
+                data_error(
+                    file,
+                    sheet,
+                    row,
+                    field,
+                    serial.to_string(),
+                    "无法解析为时间".to_string(),
+                )
+            }),
+        other => {
+            let text = other.to_string();
+            if text.trim().is_empty() {
+                return Ok(Value::Empty);
+            }
+            dates::parse_time_text(&text)
+                .map(Value::Time)
+                .ok_or_else(|| {
+                    data_error(file, sheet, row, field, text, "无法解析为时间".to_string())
+                })
+        }
+    }
+}
+
+/// 在表头中查找某统一字段的实际列号：候选同义词中恰好一个出现时返回该列号；
+/// 均未出现时返回`None`；多个同义词同时出现视为结构异常。
+pub(crate) fn resolve_synonym_column(
+    header: &[String],
+    synonyms: &[&str],
+) -> Result<Option<u32>, String> {
+    let mut found = synonyms.iter().filter_map(|&s| {
+        header
+            .iter()
+            .position(|name| name == s)
+            .map(|p| p as u32 + 1)
+    });
+    match (found.next(), found.next()) {
+        (None, _) => Ok(None),
+        (Some(col), None) => Ok(Some(col)),
+        _ => Err(format!("字段候选名称 {synonyms:?} 在表头中出现多个匹配")),
     }
 }
 

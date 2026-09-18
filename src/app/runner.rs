@@ -51,13 +51,12 @@ fn publish(job: &dyn Job, input_dir: &Path, table: &Table) -> Result<PathBuf, Pr
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        message.to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "未知错误".to_string()
-    }
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("未知错误")
+        .to_string()
 }
 
 #[cfg(test)]

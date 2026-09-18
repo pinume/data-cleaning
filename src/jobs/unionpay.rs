@@ -8,8 +8,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text,
-    cell_display, cell_text, check_duplicate_fingerprint, text_value,
+    Category, Job, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text, cell_text,
+    check_duplicate_fingerprint, data_error, text_value,
 };
 
 pub(crate) const HEADERS: [&str; 26] = [
@@ -127,24 +127,6 @@ fn matches_filename(name: &str) -> bool {
     }
 }
 
-fn data_error(
-    file: &str,
-    sheet: &str,
-    row: u32,
-    field: &str,
-    cell: &RawCell,
-    detail: String,
-) -> ProcessError {
-    ProcessError::Data {
-        file: file.to_string(),
-        sheet: sheet.to_string(),
-        row,
-        field: field.to_string(),
-        value: cell_display(cell),
-        detail,
-    }
-}
-
 fn read_record(
     sheet: &SheetGrid,
     row: u32,
@@ -160,7 +142,7 @@ fn read_record(
                 sheet_name,
                 row,
                 HEADERS[index - 1],
-                &cells[index - 1],
+                cells[index - 1].to_string(),
                 detail,
             )
         })
@@ -172,7 +154,7 @@ fn read_record(
                 sheet_name,
                 row,
                 HEADERS[index - 1],
-                &cells[index - 1],
+                cells[index - 1].to_string(),
                 detail,
             )
         })
@@ -206,18 +188,6 @@ fn read_record(
         remark: text_at(25)?,
         buyer_id: text_at(26)?,
     })
-}
-
-/// 一个工作表的内容指纹（表头+全部交易明细），用于检测两个文件是否为完全相同的重复导出。
-/// 末行提示已在校验阶段确认对全部有效文件都相同，故不参与指纹计算。
-fn sheet_fingerprint(sheet: &SheetGrid, last_row: u32) -> String {
-    let mut rows = Vec::with_capacity((last_row + 2) as usize);
-    rows.push(sheet.row_texts(1).join("\u{1}"));
-    rows.push(sheet.row_texts(2).join("\u{1}"));
-    for row in 3..last_row {
-        rows.push(sheet.row_texts(row).join("\u{1}"));
-    }
-    rows.join("\u{2}")
 }
 
 /// 文件发现 → 工作表与表头校验 → 排除首行汇总、表头、末行提示 → 重复导出检查
@@ -265,7 +235,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
                     detail: "缺少有效交易数据区域（第3行至倒数第2行）".to_string(),
                 });
             }
-            let notice = cell_display(&sheet.cell(last_row, 1));
+            let notice = sheet.cell(last_row, 1).to_string();
             if notice != D1_NOTICE {
                 return Err(ProcessError::Structure {
                     file: file_name,
@@ -274,7 +244,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
                 });
             }
 
-            let fingerprint = sheet_fingerprint(sheet, last_row);
+            let fingerprint = sheet.fingerprint(1, last_row.saturating_sub(1));
             check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
 
             for row in 3..last_row {

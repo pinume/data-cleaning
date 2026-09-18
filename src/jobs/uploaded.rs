@@ -13,7 +13,7 @@ use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL};
 use super::{
     Category, Job, MultiValueIndex, PriorityOutcome, amount_value, cell_amount, cell_date_or_text,
     cell_datetime_or_text, cell_display, cell_text, check_duplicate_fingerprint, data_error,
-    resolve_via, text_value,
+    resolve_synonym_column, resolve_via, text_value,
 };
 
 /// 前25列两组数据组结构完全相同，按固定列位置读取。
@@ -564,17 +564,7 @@ fn matches_filename(name: &str, merchant_no: &str) -> bool {
 /// 在“第26列起”的范围内按名称查找某统一字段的实际列号：候选同义词中恰好一个出现时
 /// 返回该列号；均未出现时返回`None`；多个同义词同时出现视为结构异常。
 fn resolve_tail_column(tail_domain: &[String], synonyms: &[&str]) -> Result<Option<u32>, String> {
-    let mut found = Vec::new();
-    for &synonym in synonyms {
-        if let Some(position) = tail_domain.iter().position(|name| name == synonym) {
-            found.push(FRONT_LEN as u32 + position as u32 + 1);
-        }
-    }
-    match found.as_slice() {
-        [] => Ok(None),
-        [column] => Ok(Some(*column)),
-        _ => Err(format!("字段候选名称 {synonyms:?} 在表头中出现多个匹配")),
-    }
+    resolve_synonym_column(tail_domain, synonyms).map(|opt| opt.map(|col| FRONT_LEN as u32 + col))
 }
 
 /// 前25列须按固定列位置与名称完全一致；第26列起按名称在其范围内查找（第5.1节：
@@ -601,17 +591,6 @@ fn resolve_columns(sheet: &SheetGrid, config: &UploadedConfig) -> Result<Vec<Opt
         tail_columns.push(resolved);
     }
     Ok(tail_columns)
-}
-
-/// 一个工作表的内容指纹（标题+表头+全部明细），用于检测两个不同文件是否为完全相同的重复导出。
-fn sheet_fingerprint(sheet: &SheetGrid, last_row: u32) -> String {
-    let mut rows = Vec::with_capacity((last_row + 1) as usize);
-    rows.push(sheet.row_texts(1).join("\u{1}"));
-    rows.push(sheet.row_texts(2).join("\u{1}"));
-    for row in 3..=last_row {
-        rows.push(sheet.row_texts(row).join("\u{1}"));
-    }
-    rows.join("\u{2}")
 }
 
 fn read_typed_cell(
@@ -861,7 +840,7 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
 
             let last_row = sheet.last_value_row().unwrap_or(2);
 
-            let fingerprint = sheet_fingerprint(sheet, last_row);
+            let fingerprint = sheet.fingerprint(1, last_row);
             check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
 
             for row in 3..=last_row {
