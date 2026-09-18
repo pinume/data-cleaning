@@ -1,6 +1,6 @@
 # 项目目录架构
 
-本文规定Rust实现的目录结构、模块边界和关键类型；数据字段、筛选、排序与验收规则以[project.md](project.md)为准。项目已完成全部核心模块开发，`cargo test`下115项自动化测试全部通过。下列模块为当前实现的架构规范。
+本文规定Rust实现的目录结构、模块边界和关键类型；数据字段、筛选、排序与验收规则以[project.md](project.md)为准。全部核心模块已实现并通过测试。下列模块为当前实现的架构规范。
 
 ## 1. 目录结构
 
@@ -100,7 +100,7 @@ fn main() {
 }
 ```
 
-`cli::run()`返回`Result<(), ProcessError>`。单类或批量执行完成后显示结果并直接退出，不返回菜单；执行过程中的错误由`runner`捕获并打印，不会传到`main`；只有终端读写本身失败等无法继续交互的错误才向上返回。输入结束（`read_line()`返回0）时直接返回`Ok(())`正常退出。
+`cli::run()`返回`Result<(), ProcessError>`。单类或批量执行完成后显示结果并直接退出；执行过程中的错误由`runner`捕获并打印，不会传到`main`；只有终端读写本身失败等无法继续交互的错误才向上返回。输入结束（`read_line()`返回0）时直接返回`Ok(())`正常退出。
 
 ### 3.2 结果表
 
@@ -170,10 +170,20 @@ pub trait Job {
 }
 
 pub fn registry() -> Vec<Box<dyn Job>>;       // 按编号 1–9 排列
+
+// 跨文件复用的“按某字段值查唯一命中候选”工具：coupons.rs（10.10/10.12.1/10.12.2 节）
+// 与 uploaded.rs（5.7 节）共用同一套“先剔除空值、同级内去重、歧义即停不降级”判定。
+pub(crate) type MultiValueIndex = HashMap<String, Vec<String>>;
+pub(crate) enum PriorityOutcome { Unique(String), Ambiguous, NoHit }
+pub(crate) fn resolve(hits: Vec<String>) -> PriorityOutcome;
+pub(crate) fn resolve_via(index: &MultiValueIndex, key: Option<&str>) -> PriorityOutcome;
+pub(crate) fn unique_hit(index: &MultiValueIndex, key: &str) -> Option<String>;
 ```
 
-- `uploaded.rs`用配置结构体区分菜单3、4（商户号、58列尾部字段及类型、输出基名），共用合并逻辑；前25列按固定列位置读取，第26列起按字段名称在该范围内查找（容忍第5.1节的“电脑”工作表变体），详见project.md第5.1节。
-- `refund.rs`用配置结构体区分菜单6、7（文件名模式、同义字段表、基础字段、分组优先级、`其他支付`是否允许`-`、输出基名），共用合并与沉底逻辑。
+- `uploaded.rs`用配置结构体区分菜单3、4，合并各自的58列源数据；前25列按位置读取，第26列起按字段名称查找，支持第5.1节的“电脑”工作表变体。
+- 处理明细前，按`config.category`调用对应的`RefundJob::run()`完成回款校验（菜单3↔`REFUND_DIGITAL`，菜单4↔`REFUND_APPLIANCE`）。排除`fill == Some(Fill::Pink)`的沉底记录，按`订单号`→`检索参考号`→`发票号码`建立`MultiValueIndex`。
+- 每行先经`normalize_status()`归并`状态`，再用`jobs/mod.rs`的`resolve_via`/`PriorityOutcome`逐级匹配。唯一命中时覆盖为`已回款`并取回款`补贴金额`；未命中（含歧义）时保留归并后的状态，按`交易金额 × 15%`估算并保留两位小数，家电电脑封顶`1500.00`元、数码封顶`500.00`元；交易金额缺失或非数值时金额留空。结果统一追加为第59列，详见project.md第5.7节。
+- `refund.rs`用配置结构体区分菜单6、7（文件名模式、同义字段表、基础字段、分组优先级、`其他支付`是否允许`-`、输出基名），共用合并与沉底逻辑；`OUTPUT_FIELDS`为`pub(crate)`，供`uploaded.rs`按列位置索引匹配字段。
 - 第一版不拆`uploaded/`、`refund/`子目录；代码量明显难以维护时再拆。
 
 `unionpay.rs`分为两层接口：
@@ -195,7 +205,8 @@ impl Job for UnionPayJob {
 }
 ```
 
-`coupons.rs`只复用读取层，不调用`UnionPayJob::run()`，因此不会产生菜单5的结果文件：
+`coupons.rs`只复用读取层，不调用`UnionPayJob::run()`、`InvoiceJob::run()`、`ReceiptsJob::run()`或
+`UploadedJob::run()`，因此不会产生菜单5、菜单1、菜单8、菜单3或菜单4的结果文件：
 
 ```rust
 let records = unionpay::load_records(input_dir)?;
@@ -205,6 +216,22 @@ let valid_refs: HashSet<String> = records
     .filter(|v| is_ref_no(v))                  // ^[0-9]{11}N$
     .map(str::to_owned)
     .collect();
+
+let invoices = invoice::load_records(input_dir)?;  // 未分类、未排序、未填色的全部有效发票明细
+// 按“匹配单据号”分组去重，>1 个不同“数电发票号码”视为歧义，同 10.6.2 节“歧义留空”原则。
+
+let receipts = receipts::load_records(input_dir)?;  // 已算好第 9.5 节三阶段备注，未裁剪输出列
+// 同样按“匹配单据号”分组、先剔除空备注再去重（10.12.1 节第一阶段）。
+
+// UploadedJob::run() 本身就是未分类、未排序、未填色的完整明细表（前25列固定位置），
+// 无需像 invoice/receipts 那样另外拆出 load_records；直接调用 Job::run() 复用其全部校验。
+let appliance = uploaded::UPLOADED_APPLIANCE.run(input_dir)?;
+let digital = uploaded::UPLOADED_DIGITAL.run(input_dir)?;
+// 两组合并后按“检索参考号”“发票号码”（第7、20列）分别建索引；备注第一阶段未命中时，
+// 参考号（主键）优先于数电发票号码（次键）查“状态”（第9列），10.12.2 节的两级优先级。
+
+// 两阶段都未命中（Option<String> 为 None）时，remark 固定为“未上传”文本；沉底/填色只看
+// 是否实际命中（即那个 Option 而非最终文本是否为空），10.12.3/10.12.4 节。
 ```
 
 ### 3.4 读取接口
@@ -274,7 +301,7 @@ utils
   └── 不依赖 jobs / app / io（可使用 model 中的错误类型）
 ```
 
-- 唯一的任务间依赖：`jobs::coupons` → `jobs::unionpay::load_records(...)`。该函数为`pub(crate)`，只返回有效原始交易，不做退货处理，也不产生任何输出。
+- 任务间只读依赖见`project.md`第1.2节；`coupons`复用`unionpay`、`invoice`、`receipts`和`uploaded`的数据读取，`uploaded`复用对应`refund`任务的校验与结果。被引用任务不发布输出文件。
 - 写文件和发布只由`app::runner`调用，任务模块不接触输出目录。
 
 ### 4.1 `utils::doc_no`的范围
@@ -353,31 +380,6 @@ main.rs → app::cli → app::runner
 ## 7. 测试
 
 - **纯规则单元测试**：写在`src/utils/*`等模块的`#[cfg(test)] mod tests`中，覆盖日期解析、单据号纠正、尾差判断、自然排序、参考号修正等纯函数。
-- **业务规则与工作簿解析测试**：写在各`src/jobs/*.rs`的`#[cfg(test)] mod tests`中，用`rust_xlsxwriter`现场生成小样本工作簿（含开头空白行、合计行、同名列、`-`值等边界情况），运行任务后检查字段、行数、顺序、类型及填色。无需提交二进制样本文件。`src/test_support.rs`提供唯一临时路径等共用辅助。
-- **发布集成测试**：`tests/publishing.rs`模拟目标文件已存在、临时文件缺失或为空等情况，确认原结果可恢复。集成测试是独立编译单元，无法复用`src/test_support.rs`，各自保留所需的辅助函数。
+- **业务规则与工作簿解析测试**：写在各`src/jobs/*.rs`的`#[cfg(test)] mod tests`中，用`rust_xlsxwriter`现场生成小样本工作簿（含开头空白行、合计行、同名列、`-`值等边界情况），运行任务后检查字段、行数、顺序、类型及填色。无需提交二进制样本文件。
+- **发布集成测试**：`tests/publishing.rs`模拟目标文件已存在、临时文件缺失或为空等情况，确认原结果可恢复。
 - **样本验收**：用项目根目录下的`data/`运行程序，按project.md各节“验收要求”核对当前数量与分布。此步骤不写入自动测试，因为样本数据不纳入版本控制。
-
-## 8. 构建与运行
-
-在项目根目录执行：
-
-| 用途 | 命令 |
-|---|---|
-| 开发运行 | `cargo run --locked` |
-| 运行测试 | `cargo test --locked` |
-| 代码检查 | `cargo clippy --locked --all-targets` |
-| 格式检查 | `cargo fmt --check` |
-| 发布构建 | `cargo build --release --locked` |
-
-发布产物为`target/release/data-cleaning`（Windows为`data-cleaning.exe`），复制到其他电脑即可运行，无需安装Rust。
-
-## 9. 实现顺序
-
-目录结构以本文第1节为基线，不再调整，直接进入实现：
-
-1. `Cargo.toml`、`rust-toolchain.toml`、`lib.rs`与`model`：数据模型、错误类型；随后完成`app`的交互提示、路径校验与执行退出逻辑。
-2. `io`：读取、XLSX写入与发布，完成`tests/publishing.rs`。
-3. `utils`：日期、金额、文本、自然排序、单据号工具及单元测试。
-4. `jobs`：按project.md第3–10节逐个实现。先完成`unionpay.rs`，因为`coupons.rs`依赖它。
-5. 用样本数据逐项核对project.md各节验收要求。
-

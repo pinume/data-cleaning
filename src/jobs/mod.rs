@@ -189,6 +189,43 @@ pub(crate) fn build_match_doc_no(date: &Value, doc_no_value: &str) -> String {
     }
 }
 
+/// `字段值 → 该值下全部候选（未去重）`，供`resolve`/`resolve_via`统一做歧义判定；
+/// 用于按某个匹配键在另一数据源中查找唯一命中值的场景（如销售用券情况统计第10.10/
+/// 10.12节、已上传数据与回款明细的匹配）。
+pub(crate) type MultiValueIndex = HashMap<String, Vec<String>>;
+
+pub(crate) enum PriorityOutcome {
+    Unique(String),
+    Ambiguous,
+    NoHit,
+}
+
+/// 对一组候选值去重：恰好一个不同值→`Unique`；两个及以上→`Ambiguous`；没有候选→`NoHit`。
+pub(crate) fn resolve(hits: Vec<String>) -> PriorityOutcome {
+    let distinct: std::collections::HashSet<String> = hits.into_iter().collect();
+    match distinct.len() {
+        0 => PriorityOutcome::NoHit,
+        1 => PriorityOutcome::Unique(distinct.into_iter().next().unwrap()),
+        _ => PriorityOutcome::Ambiguous,
+    }
+}
+
+/// 按`key`在索引中查找候选并去重；`key`为空或未在索引中出现时视为`NoHit`。
+pub(crate) fn resolve_via(index: &MultiValueIndex, key: Option<&str>) -> PriorityOutcome {
+    let Some(key) = key.filter(|k| !k.is_empty()) else {
+        return PriorityOutcome::NoHit;
+    };
+    resolve(index.get(key).cloned().unwrap_or_default())
+}
+
+/// 按`key`查找唯一命中值；歧义或未命中均返回`None`，不得任选。
+pub(crate) fn unique_hit(index: &MultiValueIndex, key: &str) -> Option<String> {
+    match resolve_via(index, Some(key)) {
+        PriorityOutcome::Unique(value) => Some(value),
+        PriorityOutcome::Ambiguous | PriorityOutcome::NoHit => None,
+    }
+}
+
 /// 记录并检查工作表内容指纹：同一指纹已属于另一个文件时判定为疑似重复导出并报错；
 /// 否则记录该指纹归属的当前文件。
 pub(crate) fn check_duplicate_fingerprint(

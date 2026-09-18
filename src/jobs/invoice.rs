@@ -12,7 +12,7 @@ use crate::utils::{dates, doc_no};
 
 use super::{Category, Job, cell_display, cell_text, data_error, text_value};
 
-const SOURCE_HEADERS: [&str; 30] = [
+pub(crate) const SOURCE_HEADERS: [&str; 30] = [
     "订单号",
     "创建时间",
     "开票时间",
@@ -56,15 +56,15 @@ const OUTPUT_HEADERS: [&str; 8] = [
     "匹配单据号",
 ];
 
-struct InvoiceRecord {
+pub(crate) struct InvoiceRecord {
     issue_time: Value,
     invoice_type: String,
-    invoice_no: String,
+    pub invoice_no: String,
     buyer_name: String,
     product_name: String,
     remark: String,
     invoice_status: String,
-    match_doc_no: Value,
+    pub match_doc_no: Value,
 }
 
 /// 文件名须完整符合`发票_yyyymmdd.xlsx`；返回 8 位数字部分。
@@ -280,110 +280,117 @@ impl Job for InvoiceJob {
     }
 
     fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        let path = select_latest_file(input_dir)?;
-        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
-
-        let sheets = open_sheets(&path)?;
-        if sheets.len() != 1 {
-            return Err(ProcessError::Structure {
-                file: file_name,
-                sheet: String::new(),
-                detail: format!("工作表数量异常：应为 1 个，实际为 {} 个", sheets.len()),
-            });
-        }
-        let sheet = &sheets[0];
-        let sheet_name = sheet.name().to_string();
-
-        let header = sheet.row_texts(6);
-        if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
-            return Err(ProcessError::Structure {
-                file: file_name,
-                sheet: sheet_name,
-                detail: format!("第6行表头与规定的30个字段不一致：{header:?}"),
-            });
-        }
-
-        let last_row = sheet.last_value_row().unwrap_or(0);
-
-        let mut records = Vec::new();
-        for row in 7..=last_row {
-            let issue_time = parse_issue_time(&sheet.cell(row, 3), &file_name, &sheet_name, row)?;
-
-            let invoice_type = cell_text(&sheet.cell(row, 4)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "开票类型",
-                    cell_display(&sheet.cell(row, 4)),
-                    detail,
-                )
-            })?;
-            let invoice_no = cell_text(&sheet.cell(row, 9)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "数电发票号码",
-                    cell_display(&sheet.cell(row, 9)),
-                    detail,
-                )
-            })?;
-            let buyer_name = cell_text(&sheet.cell(row, 10)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "购方名称",
-                    cell_display(&sheet.cell(row, 10)),
-                    detail,
-                )
-            })?;
-            let raw_product_name = cell_text(&sheet.cell(row, 16)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "主要商品名称",
-                    cell_display(&sheet.cell(row, 16)),
-                    detail,
-                )
-            })?;
-            let remark = cell_text(&sheet.cell(row, 21)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "备注信息",
-                    cell_display(&sheet.cell(row, 21)),
-                    detail,
-                )
-            })?;
-            let invoice_status = cell_text(&sheet.cell(row, 28)).map_err(|detail| {
-                data_error(
-                    &file_name,
-                    &sheet_name,
-                    row,
-                    "开票状态",
-                    cell_display(&sheet.cell(row, 28)),
-                    detail,
-                )
-            })?;
-
-            records.push(InvoiceRecord {
-                issue_time,
-                invoice_type,
-                invoice_no,
-                buyer_name,
-                product_name: clean_product_name(&raw_product_name),
-                match_doc_no: build_match_doc_no(&remark).map_or(Value::Empty, Value::Text),
-                remark,
-                invoice_status,
-            });
-        }
-
+        let records = load_records(input_dir)?;
         Ok(classify_and_build_table(records))
     }
+}
+
+/// 读取当前最新发票工作簿的全部有效明细（含正常、重复与异常记录），供本任务
+/// 及第 10 节`数电发票号码`匹配复用；不做分类、排序或填色。
+pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, ProcessError> {
+    let path = select_latest_file(input_dir)?;
+    let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+    let sheets = open_sheets(&path)?;
+    if sheets.len() != 1 {
+        return Err(ProcessError::Structure {
+            file: file_name,
+            sheet: String::new(),
+            detail: format!("工作表数量异常：应为 1 个，实际为 {} 个", sheets.len()),
+        });
+    }
+    let sheet = &sheets[0];
+    let sheet_name = sheet.name().to_string();
+
+    let header = sheet.row_texts(6);
+    if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
+        return Err(ProcessError::Structure {
+            file: file_name,
+            sheet: sheet_name,
+            detail: format!("第6行表头与规定的30个字段不一致：{header:?}"),
+        });
+    }
+
+    let last_row = sheet.last_value_row().unwrap_or(0);
+
+    let mut records = Vec::new();
+    for row in 7..=last_row {
+        let issue_time = parse_issue_time(&sheet.cell(row, 3), &file_name, &sheet_name, row)?;
+
+        let invoice_type = cell_text(&sheet.cell(row, 4)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "开票类型",
+                cell_display(&sheet.cell(row, 4)),
+                detail,
+            )
+        })?;
+        let invoice_no = cell_text(&sheet.cell(row, 9)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "数电发票号码",
+                cell_display(&sheet.cell(row, 9)),
+                detail,
+            )
+        })?;
+        let buyer_name = cell_text(&sheet.cell(row, 10)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "购方名称",
+                cell_display(&sheet.cell(row, 10)),
+                detail,
+            )
+        })?;
+        let raw_product_name = cell_text(&sheet.cell(row, 16)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "主要商品名称",
+                cell_display(&sheet.cell(row, 16)),
+                detail,
+            )
+        })?;
+        let remark = cell_text(&sheet.cell(row, 21)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "备注信息",
+                cell_display(&sheet.cell(row, 21)),
+                detail,
+            )
+        })?;
+        let invoice_status = cell_text(&sheet.cell(row, 28)).map_err(|detail| {
+            data_error(
+                &file_name,
+                &sheet_name,
+                row,
+                "开票状态",
+                cell_display(&sheet.cell(row, 28)),
+                detail,
+            )
+        })?;
+
+        records.push(InvoiceRecord {
+            issue_time,
+            invoice_type,
+            invoice_no,
+            buyer_name,
+            product_name: clean_product_name(&raw_product_name),
+            match_doc_no: build_match_doc_no(&remark).map_or(Value::Empty, Value::Text),
+            remark,
+            invoice_status,
+        });
+    }
+
+    Ok(records)
 }
 
 fn classify_and_build_table(records: Vec<InvoiceRecord>) -> Table {

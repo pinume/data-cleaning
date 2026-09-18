@@ -12,7 +12,7 @@ use super::{
     Category, Job, amount_value, cell_amount, cell_display, cell_text, data_error, text_value,
 };
 
-const OUTPUT_FIELDS: [&str; 24] = [
+pub(crate) const OUTPUT_FIELDS: [&str; 24] = [
     "拨付批次",
     "交易完成时间",
     "交易参考号",

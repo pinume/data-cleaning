@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -6,14 +6,14 @@ use regex::Regex;
 use rust_decimal::Decimal;
 
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
-use crate::model::{Column, ColumnType, ProcessError, Row, Table, Value};
+use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
 use crate::utils::{numbers, text};
 
-use super::unionpay;
 use super::{
-    Category, Job, build_match_doc_no, cell_display, cell_text, data_error, parse_date_field,
-    text_value,
+    Category, Job, MultiValueIndex, PriorityOutcome, build_match_doc_no, cell_display, cell_text,
+    data_error, parse_date_field, resolve, resolve_via, text_value, unique_hit,
 };
+use super::{invoice, receipts, unionpay, uploaded};
 
 const FILE_NAME: &str = "销售用券情况统计.xlsx";
 const TITLE: &str = "销售用券情况统计";
@@ -86,10 +86,8 @@ impl Job for CouponsJob {
     }
 
     fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        // 10.6.1：权威校验集缺失、结构异常或无法完整读取时必须停止，不得绕过校验；
-        // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构、重复导出）。
-        let authority = build_authority(input_dir)?;
-
+        // 10.1 节：先校验本任务自身输入文件的结构，再进入依赖外部数据源的字段生成步骤，
+        // 确保输入文件本身的问题不会被外部依赖缺失的错误提示掩盖。
         let path = input_dir.join(FILE_NAME);
         if !path.is_file() {
             return Err(ProcessError::NoInput {
@@ -136,15 +134,40 @@ impl Job for CouponsJob {
             });
         }
 
+        // 10.6.1：权威校验集缺失、结构异常或无法完整读取时必须停止，不得绕过校验；
+        // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构、重复导出）。
+        let authority = build_authority(input_dir)?;
+        // 数电发票号码：缺失或结构异常时同样必须停止，直接复用 invoice::load_records
+        // 的全部校验（最新文件选择、表头、逐行解析）。
+        let invoice_index = build_invoice_index(input_dir)?;
+        // 备注：缺失或结构异常时同样必须停止，直接复用 receipts::load_records 的全部
+        // 校验（表头、末行合计结构）及其已算好的第 9.5 节三阶段备注。
+        let receipts_index = build_receipts_index(input_dir)?;
+        // 备注兜底：缺失或结构异常时同样必须停止，直接复用已上传家电电脑/已上传数码
+        // 两个 Job 各自的全部校验（文件发现、表头、第26列起字段解析、重复UUID）。
+        let (uploaded_by_reference, uploaded_by_invoice_no) = build_uploaded_index(input_dir)?;
+
         let mut rows = Vec::new();
         for row in 3..last_row {
             let record = read_row(sheet, row, FILE_NAME, &sheet_name)?;
-            rows.push(to_row(record, &authority));
+            rows.push(to_row(
+                record,
+                &authority,
+                &invoice_index,
+                &receipts_index,
+                &uploaded_by_reference,
+                &uploaded_by_invoice_no,
+            ));
         }
+
+        // 命中收款单统计备注的记录沉底并保持粉色；其余保持原相对顺序（各自稳定分区）。
+        let (mut top, bottom): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|r| r.fill != Some(Fill::Pink));
+        top.extend(bottom);
 
         Ok(Table {
             columns: output_columns(),
-            rows,
+            rows: top,
         })
     }
 }
@@ -163,6 +186,97 @@ fn is_valid_ref_no(value: &str) -> bool {
     value.len() == 12
         && value.as_bytes()[11] == b'N'
         && value.as_bytes()[..11].iter().all(u8::is_ascii_digit)
+}
+
+/// 按`匹配单据号`汇总发票明细全部非空`数电发票号码`（未去重）；歧义判定见`to_row`
+/// 中复用的`resolve`（与 10.6.2 节"命中权威值需唯一"同一原则，不得任选）。
+fn build_invoice_index(input_dir: &Path) -> Result<MultiValueIndex, ProcessError> {
+    let records = invoice::load_records(input_dir)?;
+    let mut grouped: MultiValueIndex = HashMap::new();
+    for record in &records {
+        let Value::Text(match_doc_no) = &record.match_doc_no else {
+            continue;
+        };
+        if record.invoice_no.is_empty() {
+            continue;
+        }
+        grouped
+            .entry(match_doc_no.clone())
+            .or_default()
+            .push(record.invoice_no.clone());
+    }
+    Ok(grouped)
+}
+
+/// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
+fn build_receipts_index(input_dir: &Path) -> Result<MultiValueIndex, ProcessError> {
+    let records = receipts::load_records(input_dir)?;
+    let mut grouped: MultiValueIndex = HashMap::new();
+    for record in &records {
+        if record.match_doc_no.is_empty() || record.remark.is_empty() {
+            continue;
+        }
+        grouped
+            .entry(record.match_doc_no.clone())
+            .or_default()
+            .push(record.remark.clone());
+    }
+    Ok(grouped)
+}
+
+// 已上传家电电脑/已上传数码前25列固定结构中的字段位置（0 基，对齐 Table.rows[].values）。
+const UPLOADED_COL_REFERENCE: usize = 6; // 检索参考号
+const UPLOADED_COL_STATUS: usize = 8; // 状态
+const UPLOADED_COL_INVOICE_NO: usize = 19; // 发票号码
+
+/// 按`检索参考号`和`发票号码`分别汇总已上传家电电脑、已上传数码合并后的全部非空`状态`
+/// （未去重）；两个数据组共用同一对索引，不按财务大类等字段区分数据组。
+fn build_uploaded_index(
+    input_dir: &Path,
+) -> Result<(MultiValueIndex, MultiValueIndex), ProcessError> {
+    let mut by_reference: MultiValueIndex = HashMap::new();
+    let mut by_invoice_no: MultiValueIndex = HashMap::new();
+
+    for job in [&uploaded::UPLOADED_APPLIANCE, &uploaded::UPLOADED_DIGITAL] {
+        let table = job.run(input_dir)?;
+        for row in &table.rows {
+            let Value::Text(status) = &row.values[UPLOADED_COL_STATUS] else {
+                continue;
+            };
+            if let Value::Text(reference) = &row.values[UPLOADED_COL_REFERENCE] {
+                by_reference
+                    .entry(reference.clone())
+                    .or_default()
+                    .push(status.clone());
+            }
+            if let Value::Text(invoice_no) = &row.values[UPLOADED_COL_INVOICE_NO] {
+                by_invoice_no
+                    .entry(invoice_no.clone())
+                    .or_default()
+                    .push(status.clone());
+            }
+        }
+    }
+    Ok((by_reference, by_invoice_no))
+}
+
+/// 按`参考号`（主键）优先、`数电发票号码`（次键）兜底，在已上传数据索引中查找唯一命中的
+/// `状态`；仅当主键未命中（键为空或索引查无）时才尝试次键，歧义则立即留空、不再降级。
+fn uploaded_status(
+    by_reference: &MultiValueIndex,
+    by_invoice_no: &MultiValueIndex,
+    reference: Option<&str>,
+    invoice_no: Option<&str>,
+) -> Option<String> {
+    match resolve_via(by_reference, reference) {
+        PriorityOutcome::Unique(value) => return Some(value),
+        PriorityOutcome::Ambiguous => return None,
+        PriorityOutcome::NoHit => {}
+    }
+    match resolve_via(by_invoice_no, invoice_no) {
+        PriorityOutcome::Unique(value) => Some(value),
+        PriorityOutcome::Ambiguous | PriorityOutcome::NoHit => None,
+    }
 }
 
 /// 补贴额：取源字段`合计`，按 10.7 节尾差规则统一为两位小数；为空或超出容差时终止。
@@ -239,23 +353,68 @@ fn quantity_of(subsidy: Decimal) -> i64 {
     }
 }
 
-fn to_row(record: CouponRecord, authority: &HashSet<String>) -> Row {
+fn to_row(
+    record: CouponRecord,
+    authority: &HashSet<String>,
+    invoice_index: &MultiValueIndex,
+    receipts_index: &MultiValueIndex,
+    uploaded_by_reference: &MultiValueIndex,
+    uploaded_by_invoice_no: &MultiValueIndex,
+) -> Row {
     let quantity = quantity_of(record.subsidy);
     let match_doc_no = build_match_doc_no(&record.doc_date, &record.doc_no);
     let reference = extract_reference(&record.summary, authority);
+    let invoice_no = unique_hit(invoice_index, &match_doc_no);
+    // 备注：先按匹配单据号命中收款单统计；仍为空时，按参考号（主键）/数电发票号码
+    // （次键）在已上传家电电脑、已上传数码中兜底查找状态（第10.12节）。
+    let remark = unique_hit(receipts_index, &match_doc_no).or_else(|| {
+        uploaded_status(
+            uploaded_by_reference,
+            uploaded_by_invoice_no,
+            reference.as_deref(),
+            invoice_no.as_deref(),
+        )
+    });
+    let fill = remark.is_some().then_some(Fill::Pink);
+    // 10.12.3 节：两阶段均未命中（含歧义、空键）时，备注固定填“未上传”，不沉底不填色；
+    // 空值从不参与前两阶段的匹配，这里只是给最终仍为空的结果一个统一的文本标记。
+    let remark_text = remark.unwrap_or_else(|| "未上传".to_string());
 
     let values = vec![
         text_value(record.doc_no),
         record.doc_date,
         text_value(record.product_name),
-        text_value(record.brand),
-        text_value(record.finance_category),
+        text_value(normalize_brand(record.brand)),
+        text_value(normalize_finance_category(record.finance_category)),
         Value::Decimal(record.subsidy),
         Value::Integer(quantity),
         reference.map_or(Value::Empty, Value::Text),
+        invoice_no.map_or(Value::Empty, Value::Text),
         text_value(match_doc_no),
+        Value::Text(remark_text),
     ];
-    Row { values, fill: None }
+    Row { values, fill }
+}
+
+/// 10.11 节品牌归并：仅替换列出的原值，其余原样保留。
+fn normalize_brand(value: String) -> String {
+    match value.as_str() {
+        "COLMO厨热JX" | "美的厨热JX" | "东芝JX" | "华凌" | "小天鹅" | "COLMO" => {
+            "美的".to_string()
+        }
+        "卡萨帝" | "统帅" => "海尔".to_string(),
+        "晶弘" => "格力".to_string(),
+        _ => value,
+    }
+}
+
+/// 10.11 节财务大类归并：仅替换列出的原值，其余原样保留。
+fn normalize_finance_category(value: String) -> String {
+    match value.as_str() {
+        "国产彩电" | "进口彩电" => "彩电".to_string(),
+        "新业务类" => "数码".to_string(),
+        _ => value,
+    }
 }
 
 fn output_columns() -> Vec<Column> {
@@ -293,7 +452,15 @@ fn output_columns() -> Vec<Column> {
             ty: ColumnType::Text,
         },
         Column {
+            name: "数电发票号码",
+            ty: ColumnType::Text,
+        },
+        Column {
             name: "匹配单据号",
+            ty: ColumnType::Text,
+        },
+        Column {
+            name: "备注",
             ty: ColumnType::Text,
         },
     ]
@@ -302,21 +469,6 @@ fn output_columns() -> Vec<Column> {
 // ---------------------------------------------------------------------------
 // 10.6 节：参考号提取（四级优先级，命中即停，同级内先去重再判定）。
 // ---------------------------------------------------------------------------
-
-enum PriorityOutcome {
-    Unique(String),
-    Ambiguous,
-    NoHit,
-}
-
-fn resolve(hits: Vec<String>) -> PriorityOutcome {
-    let distinct: HashSet<String> = hits.into_iter().collect();
-    match distinct.len() {
-        0 => PriorityOutcome::NoHit,
-        1 => PriorityOutcome::Unique(distinct.into_iter().next().unwrap()),
-        _ => PriorityOutcome::Ambiguous,
-    }
-}
 
 fn extract_reference(summary: &str, authority: &HashSet<String>) -> Option<String> {
     if summary.trim().is_empty() {
@@ -461,7 +613,10 @@ mod tests {
     use rust_xlsxwriter::Workbook;
 
     use super::*;
-    use crate::jobs::unionpay;
+    use crate::jobs::{invoice, receipts, refund, unionpay, uploaded};
+
+    const MERCHANT_DIGITAL: &str = "89813014812B06R";
+    const MERCHANT_APPLIANCE: &str = "89813015722APT1";
     use crate::test_support::unique_temp_path;
 
     fn authority_of(values: &[&str]) -> HashSet<String> {
@@ -474,6 +629,33 @@ mod tests {
         assert!(!is_valid_ref_no("16867252734W")); // 结尾不是大写 N
         assert!(!is_valid_ref_no("1686725273N")); // 只有 10 位数字
         assert!(!is_valid_ref_no("16867252734n")); // 小写 n 不算
+    }
+
+    #[test]
+    fn normalizes_listed_brands_and_keeps_others() {
+        for brand in [
+            "COLMO厨热JX",
+            "美的厨热JX",
+            "东芝JX",
+            "华凌",
+            "小天鹅",
+            "COLMO",
+        ] {
+            assert_eq!(normalize_brand(brand.to_string()), "美的");
+        }
+        for brand in ["卡萨帝", "统帅"] {
+            assert_eq!(normalize_brand(brand.to_string()), "海尔");
+        }
+        assert_eq!(normalize_brand("晶弘".to_string()), "格力");
+        assert_eq!(normalize_brand("海信".to_string()), "海信"); // 未列出的品牌原样保留
+    }
+
+    #[test]
+    fn normalizes_listed_finance_categories_and_keeps_others() {
+        assert_eq!(normalize_finance_category("国产彩电".to_string()), "彩电");
+        assert_eq!(normalize_finance_category("进口彩电".to_string()), "彩电");
+        assert_eq!(normalize_finance_category("新业务类".to_string()), "数码");
+        assert_eq!(normalize_finance_category("空调".to_string()), "空调"); // 未列出的类别原样保留
     }
 
     #[test]
@@ -626,6 +808,137 @@ mod tests {
             .unwrap();
     }
 
+    /// 构造一份最小合法的发票明细样本（单工作表、30 字段表头），供数电发票号码匹配测试；
+    /// `rows`为`(备注信息, 数电发票号码)`对，其余字段使用固定合法占位值。
+    fn write_invoice_fixture(dir: &Path, rows: &[(&str, &str)]) {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("发票_20260914").unwrap();
+        for (col, header) in invoice::SOURCE_HEADERS.iter().enumerate() {
+            sheet.write_string(5, col as u16, *header).unwrap();
+        }
+        for (index, (remark, invoice_no)) in rows.iter().enumerate() {
+            let row = (6 + index) as u32;
+            let values: [&str; 30] = [
+                "ORDER001",
+                "2026-09-14 09:00:00",
+                "2026-09-14 10:00:00",
+                "蓝票",
+                "数电发票",
+                "正常发票",
+                "",
+                "",
+                invoice_no,
+                "张三",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "商品甲",
+                "100.00",
+                "13%",
+                "88.50",
+                "11.50",
+                remark,
+                "总店",
+                "自动开票",
+                "开票员甲",
+                "收款人甲",
+                "复核人甲",
+                "",
+                "开票完成",
+                "操作人甲",
+                "已打印",
+            ];
+            for (col, value) in values.iter().enumerate() {
+                sheet.write_string(row, col as u16, *value).unwrap();
+            }
+        }
+        workbook.save(dir.join("发票_20260914.xlsx")).unwrap();
+    }
+
+    /// 构造一份最小合法的收款单统计样本（单工作表、60 字段表头、标题+表头+合计结构），
+    /// 供备注匹配测试；`rows`为`(日期, 单据号, 销售类别, 原票号)`四元组，其余字段留空。
+    /// `销售类别="退货"`可直接得到非空初始备注`退货-退单`，无需再构造跨阶段关联。
+    fn write_receipts_fixture(dir: &Path, rows: &[(&str, &str, &str, &str)]) {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.write_string(0, 0, "标题").unwrap();
+        for (col, header) in receipts::SOURCE_HEADERS.iter().enumerate() {
+            sheet.write_string(1, col as u16, *header).unwrap();
+        }
+        for (index, (date, doc_no, sale_category, original_ticket_no)) in rows.iter().enumerate() {
+            let row = (2 + index) as u32;
+            sheet.write_string(row, 0, *date).unwrap(); // 日期
+            sheet.write_string(row, 2, *doc_no).unwrap(); // 单据号
+            sheet.write_string(row, 8, *sale_category).unwrap(); // 销售类别
+            sheet.write_string(row, 40, *original_ticket_no).unwrap(); // 原票号
+        }
+        let total_row = (2 + rows.len()) as u32;
+        sheet.write_string(total_row, 0, "合计").unwrap();
+        workbook.save(dir.join("收款单统计.xlsx")).unwrap();
+    }
+
+    /// 构造一份最小合法的已上传数据样本（单工作表、58 字段表头：前25列固定 + 对应
+    /// 数据组的尾部字段名），供备注兜底匹配测试；`rows`为
+    /// `(实时清分UUID, 检索参考号, 状态, 发票号码)`四元组，其余字段留空。
+    fn write_uploaded_fixture(
+        dir: &Path,
+        merchant_no: &str,
+        tail: &[uploaded::TailField],
+        rows: &[(&str, &str, &str, &str)],
+    ) {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.write_string(0, 0, "标题").unwrap();
+        for (col, header) in uploaded::FRONT_HEADERS.iter().enumerate() {
+            sheet.write_string(1, col as u16, *header).unwrap();
+        }
+        for (col, field) in tail.iter().enumerate() {
+            sheet
+                .write_string(
+                    1,
+                    (uploaded::FRONT_HEADERS.len() + col) as u16,
+                    field.synonyms[0],
+                )
+                .unwrap();
+        }
+        for (index, (uuid, reference, status, invoice_no)) in rows.iter().enumerate() {
+            let row = (2 + index) as u32;
+            sheet.write_string(row, 0, *uuid).unwrap(); // 实时清分UUID
+            sheet.write_string(row, 1, merchant_no).unwrap(); // 商户号（须与文件名一致）
+            sheet.write_string(row, 6, *reference).unwrap(); // 检索参考号
+            sheet.write_string(row, 8, *status).unwrap(); // 状态
+            sheet.write_string(row, 19, *invoice_no).unwrap(); // 发票号码
+        }
+        workbook
+            .save(dir.join(format!("MER_{merchant_no}_20260914101809_yjhx.xlsx")))
+            .unwrap();
+    }
+
+    /// 写入一份没有明细的最小合法回款明细样本（家电电脑或数码），仅用于满足已上传数据
+    /// 内部匹配补贴金额时的前置依赖存在；24列表头取回款明细的统一确认名称，对两个数据组
+    /// 的必需字段判定均有效。
+    fn write_empty_refund_fixture(dir: &Path, filename: &str) {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        for (col, header) in refund::OUTPUT_FIELDS.iter().enumerate() {
+            sheet.write_string(0, col as u16, *header).unwrap();
+        }
+        workbook.save(dir.join(filename)).unwrap();
+    }
+
+    /// 两个已上传数据组各写入一份没有明细的最小合法样本，并同时写入两份空回款明细样本
+    /// （已上传数据内部会按订单号/检索参考号/发票号码匹配回款明细的补贴金额），仅用于
+    /// 满足前置依赖存在。
+    fn write_empty_uploaded_fixtures(dir: &Path) {
+        write_empty_refund_fixture(dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(dir, "2026年数码补贴明细.xlsx");
+        write_uploaded_fixture(dir, MERCHANT_APPLIANCE, &uploaded::APPLIANCE_TAIL, &[]);
+        write_uploaded_fixture(dir, MERCHANT_DIGITAL, &uploaded::DIGITAL_TAIL, &[]);
+    }
+
     fn write_coupons_workbook(dir: &Path, rows: &[(&str, &str, &str, &str, &str, &str, &str)]) {
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();
@@ -671,6 +984,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         write_unionpay_fixture(&dir, "16867252734N");
+        // 第一条发票明细的匹配单据号与销售明细第一行一致，可用于命中数电发票号码；
+        // 第二行销售明细的匹配单据号在发票明细中没有对应记录，应留空。
+        write_invoice_fixture(
+            &dir,
+            &[(
+                "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                "24312000000000000009",
+            )],
+        );
+        // 收款单统计中没有任何匹配单据号能命中这两行，备注列应全部留空、不触发沉底。
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
         write_coupons_workbook(
             &dir,
             &[
@@ -696,10 +1021,11 @@ mod tests {
         );
 
         let table = CouponsJob.run(&dir).unwrap();
-        assert_eq!(table.columns.len(), 9);
+        assert_eq!(table.columns.len(), 11);
         assert_eq!(table.rows.len(), 2);
 
-        // 第一行：参考号原样命中，补贴额为正，数量为 1，匹配单据号保留“收款”前缀已剥离后拼接。
+        // 第一行：参考号原样命中，补贴额为正，数量为 1，匹配单据号保留“收款”前缀已剥离后拼接，
+        // 并按匹配单据号在发票明细中唯一命中数电发票号码。
         assert_eq!(
             table.rows[0].values[0],
             Value::Text("收款ZFFX000003".to_string())
@@ -715,16 +1041,421 @@ mod tests {
         );
         assert_eq!(
             table.rows[0].values[8],
+            Value::Text("24312000000000000009".to_string())
+        );
+        assert_eq!(
+            table.rows[0].values[9],
+            Value::Text("260829ZFFX000003".to_string())
+        );
+        // 收款单统计及已上传数据（本用例为空样本）均无命中，备注按10.12.3节固定为“未上传”。
+        assert_eq!(table.rows[0].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[0].fill, None); // 未命中备注，不沉底不填色
+
+        // 第二行：摘要中无编号，参考号留空；补贴额为负，数量为 -1；
+        // 匹配单据号在发票明细中无对应记录，数电发票号码留空。
+        assert_eq!(table.rows[1].values[6], Value::Integer(-1));
+        assert_eq!(table.rows[1].values[7], Value::Empty);
+        assert_eq!(table.rows[1].values[8], Value::Empty);
+        assert_eq!(
+            table.rows[1].values[9],
+            Value::Text("260830ZFFX000004".to_string())
+        );
+        assert_eq!(table.rows[1].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[1].fill, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaves_invoice_no_blank_when_match_doc_no_is_ambiguous_in_invoice_source() {
+        let dir = unique_temp_path("coupons-invoice-ambiguous");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        // 两条发票明细生成相同的匹配单据号，但数电发票号码不同：属于歧义，不得任选。
+        write_invoice_fixture(
+            &dir,
+            &[
+                (
+                    "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                    "24312000000000000001",
+                ),
+                (
+                    "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                    "24312000000000000002",
+                ),
+            ],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[8], Value::Empty);
+        assert_eq!(
+            table.rows[0].values[9],
             Value::Text("260829ZFFX000003".to_string())
         );
 
-        // 第二行：摘要中无编号，参考号留空；补贴额为负，数量为 -1。
-        assert_eq!(table.rows[1].values[6], Value::Integer(-1));
-        assert_eq!(table.rows[1].values[7], Value::Empty);
-        assert_eq!(
-            table.rows[1].values[8],
-            Value::Text("260830ZFFX000004".to_string())
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn matched_remark_sinks_to_bottom_with_pink_fill_and_unmatched_rows_keep_order() {
+        let dir = unique_temp_path("coupons-remark-sink");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        // “退货”销售类别直接得到非空初始备注“退货-退单”，其匹配单据号与销售明细
+        // 第一行（收款ZFFX000003 / 2026-08-29）一致，构成唯一命中。
+        write_receipts_fixture(&dir, &[("2026-08-29", "收款ZFFX000003", "退货", "")]);
+        write_empty_uploaded_fixtures(&dir);
+        write_coupons_workbook(
+            &dir,
+            &[
+                (
+                    "收款ZFFX000003",
+                    "2026-08-29",
+                    "商品甲",
+                    "品牌甲",
+                    "家电",
+                    "无编号",
+                    "10.00",
+                ),
+                (
+                    "ZFFX000004",
+                    "2026-08-30",
+                    "商品乙",
+                    "品牌乙",
+                    "数码",
+                    "无编号",
+                    "-5.00",
+                ),
+            ],
         );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 2);
+
+        // 未命中的第二行沉到顶部并保持原样；命中的第一行沉到底部，备注和粉色填充都到位。
+        assert_eq!(
+            table.rows[0].values[0],
+            Value::Text("ZFFX000004".to_string())
+        );
+        assert_eq!(table.rows[0].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[0].fill, None);
+
+        assert_eq!(
+            table.rows[1].values[0],
+            Value::Text("收款ZFFX000003".to_string())
+        );
+        assert_eq!(
+            table.rows[1].values[10],
+            Value::Text("退货-退单".to_string())
+        );
+        assert_eq!(table.rows[1].fill, Some(Fill::Pink));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_remark_in_a_hit_group_does_not_cause_ambiguity() {
+        let dir = unique_temp_path("coupons-remark-blank-not-ambiguous");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        // 两条收款单统计明细命中同一个匹配单据号：一条“退货”产生非空备注“退货-退单”，
+        // 一条“正常销售”且未被关联匹配命中、初始备注为空。规则 A 下空备注不参与歧义
+        // 判定，去重后非空备注唯一，应正常命中“退货-退单”，不算歧义。
+        write_receipts_fixture(
+            &dir,
+            &[
+                ("2026-08-29", "收款ZFFX000003", "退货", ""),
+                ("2026-08-29", "收款ZFFX000003", "正常销售", ""),
+            ],
+        );
+        write_empty_uploaded_fixtures(&dir);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(
+            table.rows[0].values[10],
+            Value::Text("退货-退单".to_string())
+        );
+        assert_eq!(table.rows[0].fill, Some(Fill::Pink));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn falls_through_to_not_uploaded_when_match_doc_no_has_two_distinct_nonblank_remarks() {
+        let dir = unique_temp_path("coupons-remark-ambiguous");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        // 两条收款单统计明细命中同一个匹配单据号，且各自的非空初始备注不同
+        // （“退货”→“退货-退单”，“零售补差”→“零售补差”）：属于歧义，不得任选，
+        // 视为两阶段均未命中，备注按10.12.3节固定为“未上传”，不沉底、不上色。
+        write_receipts_fixture(
+            &dir,
+            &[
+                ("2026-08-29", "收款ZFFX000003", "退货", ""),
+                ("2026-08-29", "收款ZFFX000003", "零售补差", ""),
+            ],
+        );
+        write_empty_uploaded_fixtures(&dir);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[0].fill, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_uploaded_status_by_reference_when_receipts_remark_is_blank() {
+        let dir = unique_temp_path("coupons-uploaded-by-reference");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        write_receipts_fixture(&dir, &[]); // 收款单统计无命中，备注留空进入兜底匹配。
+        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[("U001", "16867252734N", "已上传", "")],
+        );
+        write_uploaded_fixture(&dir, MERCHANT_DIGITAL, &uploaded::DIGITAL_TAIL, &[]);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "参考号：16867252734N",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[10], Value::Text("已上传".to_string()));
+        assert_eq!(table.rows[0].fill, Some(Fill::Pink));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_uploaded_status_by_invoice_no_when_reference_has_no_hit() {
+        let dir = unique_temp_path("coupons-uploaded-by-invoice-no");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        // 摘要中没有可提取的参考号，主键（参考号）无命中，须降级到次键（数电发票号码）。
+        write_invoice_fixture(
+            &dir,
+            &[(
+                "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                "24312000000000000009",
+            )],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_uploaded_fixture(&dir, MERCHANT_APPLIANCE, &uploaded::APPLIANCE_TAIL, &[]);
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_DIGITAL,
+            &uploaded::DIGITAL_TAIL,
+            &[("U002", "", "已开票", "24312000000000000009")],
+        );
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[10], Value::Text("已开票".to_string()));
+        assert_eq!(table.rows[0].fill, Some(Fill::Pink));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reference_match_takes_priority_over_invoice_no_in_uploaded_status_lookup() {
+        let dir = unique_temp_path("coupons-uploaded-priority");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(
+            &dir,
+            &[(
+                "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                "24312000000000000009",
+            )],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        // 参考号和数电发票号码分别命中不同状态：主键（参考号）命中的值必须胜出。
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[("U003", "16867252734N", "参考号命中", "")],
+        );
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_DIGITAL,
+            &uploaded::DIGITAL_TAIL,
+            &[("U004", "", "发票号命中", "24312000000000000009")],
+        );
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "参考号：16867252734N",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(
+            table.rows[0].values[10],
+            Value::Text("参考号命中".to_string())
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn falls_through_to_not_uploaded_when_uploaded_reference_match_is_ambiguous() {
+        let dir = unique_temp_path("coupons-uploaded-ambiguous");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        // 数电发票号码同样能命中，但主键歧义须立即判定未命中，不得降级到次键。
+        write_invoice_fixture(
+            &dir,
+            &[(
+                "销售日期:2026-08-29 单据号:收款ZFFX000003",
+                "24312000000000000009",
+            )],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[
+                ("U005", "16867252734N", "状态甲", ""),
+                ("U006", "16867252734N", "状态乙", ""),
+            ],
+        );
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_DIGITAL,
+            &uploaded::DIGITAL_TAIL,
+            &[("U007", "", "发票号命中", "24312000000000000009")],
+        );
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000003",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "参考号：16867252734N",
+                "10.00",
+            )],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[0].fill, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_no_input_when_uploaded_source_missing() {
+        let dir = unique_temp_path("coupons-missing-uploaded");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        write_receipts_fixture(&dir, &[]);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "Z1",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        // 已上传家电电脑/已上传数码样本文件缺失：必须停止，不得让备注兜底匹配静默跳过。
+        let error = CouponsJob.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::NoInput { .. }));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -734,6 +1465,9 @@ mod tests {
         let dir = unique_temp_path("coupons-bad-title");
         std::fs::create_dir_all(&dir).unwrap();
         write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
 
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();
@@ -746,6 +1480,22 @@ mod tests {
 
         let error = CouponsJob.run(&dir).unwrap_err();
         assert!(matches!(error, ProcessError::Structure { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_own_structure_error_before_checking_external_dependencies() {
+        let dir = unique_temp_path("coupons-own-file-checked-first");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 输入目录完全空白：销售用券情况统计.xlsx 与全部外部依赖（门店银联、发票明细、
+        // 收款单统计、已上传数据）均缺失。按10.1节顺序，须先报告本任务自身输入文件缺失，
+        // 不得让外部依赖缺失的错误抢先出现，掩盖了真正的问题（本文件根本不存在）。
+        let error = CouponsJob.run(&dir).unwrap_err();
+        match error {
+            ProcessError::NoInput { pattern } => assert_eq!(pattern, FILE_NAME),
+            other => panic!("expected NoInput for {FILE_NAME}, got {other:?}"),
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -775,10 +1525,64 @@ mod tests {
     }
 
     #[test]
+    fn reports_no_input_when_invoice_source_missing() {
+        let dir = unique_temp_path("coupons-missing-invoice");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "Z1",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        // 发票明细样本文件缺失：必须停止，不得让数电发票号码列全部留空后继续输出。
+        let error = CouponsJob.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::NoInput { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_no_input_when_receipts_source_missing() {
+        let dir = unique_temp_path("coupons-missing-receipts");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "Z1",
+                "2026-08-29",
+                "商品甲",
+                "品牌甲",
+                "家电",
+                "无编号",
+                "10.00",
+            )],
+        );
+
+        // 收款单统计样本文件缺失：必须停止，不得让备注列全部留空后继续输出。
+        let error = CouponsJob.run(&dir).unwrap_err();
+        assert!(matches!(error, ProcessError::NoInput { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn rejects_empty_subsidy_amount() {
         let dir = unique_temp_path("coupons-empty-subsidy");
         std::fs::create_dir_all(&dir).unwrap();
         write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
 
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();

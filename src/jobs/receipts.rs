@@ -11,7 +11,7 @@ use super::{
 
 const FILE_NAME: &str = "收款单统计.xlsx";
 
-const SOURCE_HEADERS: [&str; 60] = [
+pub(crate) const SOURCE_HEADERS: [&str; 60] = [
     "日期",
     "销售部门",
     "单据号",
@@ -81,16 +81,16 @@ const COL_SALE_CATEGORY: u32 = 9;
 const COL_PRODUCT_NAME: u32 = 21;
 const COL_ORIGINAL_TICKET_NO: u32 = 41;
 
-struct ReceiptRecord {
+pub(crate) struct ReceiptRecord {
     date: Value,
     doc_no: String,
     product_name: String,
     original_ticket_no: String,
     /// 空字符串表示未生成（日期或单据号为空）。
-    match_doc_no: String,
+    pub match_doc_no: String,
     /// 仅用于备注生成，不作为输出字段。
     sale_category: String,
-    remark: String,
+    pub remark: String,
 }
 
 pub struct ReceiptsJob;
@@ -109,56 +109,63 @@ impl Job for ReceiptsJob {
     }
 
     fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        let path = input_dir.join(FILE_NAME);
-        if !path.is_file() {
-            return Err(ProcessError::NoInput {
-                pattern: FILE_NAME.to_string(),
-            });
-        }
-
-        let sheets = open_sheets(&path)?;
-        if sheets.len() != 1 {
-            return Err(ProcessError::Structure {
-                file: FILE_NAME.to_string(),
-                sheet: String::new(),
-                detail: format!("工作表数量异常：应为 1 个，实际为 {} 个", sheets.len()),
-            });
-        }
-        let sheet = &sheets[0];
-        let sheet_name = sheet.name().to_string();
-
-        let header = sheet.row_texts(2);
-        if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
-            return Err(ProcessError::Structure {
-                file: FILE_NAME.to_string(),
-                sheet: sheet_name,
-                detail: "第2行表头与规定的60个字段不一致".to_string(),
-            });
-        }
-
-        let last_row = sheet.last_value_row().unwrap_or(2);
-        let total_marker = cell_display(&sheet.cell(last_row, 1));
-        if total_marker != "合计" {
-            return Err(ProcessError::Structure {
-                file: FILE_NAME.to_string(),
-                sheet: sheet_name,
-                detail: format!("最后一个实际有值行第1列应为“合计”，实际为“{total_marker}”"),
-            });
-        }
-
-        let mut records = Vec::new();
-        for row in 3..last_row {
-            records.push(read_row(sheet, row, FILE_NAME, &sheet_name)?);
-        }
-
-        compute_remarks(&mut records);
-
+        let records = load_records(input_dir)?;
         let rows = records.into_iter().map(to_row).collect();
         Ok(Table {
             columns: output_columns(),
             rows,
         })
     }
+}
+
+/// 读取并计算全部有效明细的`备注`（第 9.5 节三阶段处理已完成），供本任务及第 10 节
+/// 销售用券情况统计的`备注`匹配复用；不做输出列裁剪。
+pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, ProcessError> {
+    let path = input_dir.join(FILE_NAME);
+    if !path.is_file() {
+        return Err(ProcessError::NoInput {
+            pattern: FILE_NAME.to_string(),
+        });
+    }
+
+    let sheets = open_sheets(&path)?;
+    if sheets.len() != 1 {
+        return Err(ProcessError::Structure {
+            file: FILE_NAME.to_string(),
+            sheet: String::new(),
+            detail: format!("工作表数量异常：应为 1 个，实际为 {} 个", sheets.len()),
+        });
+    }
+    let sheet = &sheets[0];
+    let sheet_name = sheet.name().to_string();
+
+    let header = sheet.row_texts(2);
+    if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
+        return Err(ProcessError::Structure {
+            file: FILE_NAME.to_string(),
+            sheet: sheet_name,
+            detail: "第2行表头与规定的60个字段不一致".to_string(),
+        });
+    }
+
+    let last_row = sheet.last_value_row().unwrap_or(2);
+    let total_marker = cell_display(&sheet.cell(last_row, 1));
+    if total_marker != "合计" {
+        return Err(ProcessError::Structure {
+            file: FILE_NAME.to_string(),
+            sheet: sheet_name,
+            detail: format!("最后一个实际有值行第1列应为“合计”，实际为“{total_marker}”"),
+        });
+    }
+
+    let mut records = Vec::new();
+    for row in 3..last_row {
+        records.push(read_row(sheet, row, FILE_NAME, &sheet_name)?);
+    }
+
+    compute_remarks(&mut records);
+
+    Ok(records)
 }
 
 fn read_row(
