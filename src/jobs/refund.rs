@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 
 use crate::io::paths::list_xlsx_files;
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
-use crate::utils::numbers;
 
 use super::{
     Category, Job, amount_value, cell_amount, cell_display, cell_text, data_error, text_value,
@@ -237,7 +237,7 @@ fn cell_ratio(cell: &RawCell) -> Result<Option<Decimal>, String> {
             }))
         }
         RawCell::Int(n) => Ok(Some(Decimal::from(*n))),
-        RawCell::Float(f) => numbers::from_f64(*f)
+        RawCell::Float(f) => Decimal::from_f64(*f)
             .map(Some)
             .ok_or_else(|| format!("数值 {f} 无法转换为比例")),
         other => Err(format!("比例字段出现非数值内容：{}", cell_display(other))),

@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
@@ -289,7 +290,7 @@ fn parse_subsidy(
     let raw: Option<Decimal> = match cell {
         RawCell::Text(t) if t.trim().is_empty() => None,
         RawCell::Int(n) => Some(Decimal::from(*n)),
-        RawCell::Float(f) => numbers::from_f64(*f),
+        RawCell::Float(f) => Decimal::from_f64(*f),
         RawCell::Text(t) => t.trim().parse().ok(),
         _ => None,
     };
@@ -365,9 +366,9 @@ fn to_row(
     let match_doc_no = build_match_doc_no(&record.doc_date, &record.doc_no);
     let reference = extract_reference(&record.summary, authority);
     let invoice_no = unique_hit(invoice_index, &match_doc_no);
-    // 备注：先按匹配单据号命中收款单统计；仍为空时，按参考号（主键）/数电发票号码
-    // （次键）在已上传家电电脑、已上传数码中兜底查找状态（第10.12节）。
-    let remark = unique_hit(receipts_index, &match_doc_no).or_else(|| {
+    let receipts_hit = unique_hit(receipts_index, &match_doc_no);
+    let fill = receipts_hit.is_some().then_some(Fill::Pink);
+    let remark = receipts_hit.or_else(|| {
         uploaded_status(
             uploaded_by_reference,
             uploaded_by_invoice_no,
@@ -375,7 +376,6 @@ fn to_row(
             invoice_no.as_deref(),
         )
     });
-    let fill = remark.is_some().then_some(Fill::Pink);
     // 10.12.3 节：两阶段均未命中（含歧义、空键）时，备注固定填“未上传”，不沉底不填色；
     // 空值从不参与前两阶段的匹配，这里只是给最终仍为空的结果一个统一的文本标记。
     let remark_text = remark.unwrap_or_else(|| "未上传".to_string());
@@ -1281,7 +1281,7 @@ mod tests {
 
         let table = CouponsJob.run(&dir).unwrap();
         assert_eq!(table.rows[0].values[10], Value::Text("已上传".to_string()));
-        assert_eq!(table.rows[0].fill, Some(Fill::Pink));
+        assert_eq!(table.rows[0].fill, None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1325,7 +1325,7 @@ mod tests {
 
         let table = CouponsJob.run(&dir).unwrap();
         assert_eq!(table.rows[0].values[10], Value::Text("已开票".to_string()));
-        assert_eq!(table.rows[0].fill, Some(Fill::Pink));
+        assert_eq!(table.rows[0].fill, None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1377,6 +1377,79 @@ mod tests {
             table.rows[0].values[10],
             Value::Text("参考号命中".to_string())
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn phase_two_hit_does_not_fill_pink_and_does_not_sink() {
+        let dir = unique_temp_path("coupons-phase-two-no-pink-no-sink");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(&dir, &[]);
+        // 第一行命中第一阶段（收款单统计），将填粉色并沉底
+        write_receipts_fixture(&dir, &[("2026-08-29", "收款ZFFX000001", "退货", "")]);
+        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        // 第二行命中第二阶段（已上传数据），不填粉色、不沉底
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[("U001", "16867252734N", "已上传", "")],
+        );
+        write_uploaded_fixture(&dir, MERCHANT_DIGITAL, &uploaded::DIGITAL_TAIL, &[]);
+
+        write_coupons_workbook(
+            &dir,
+            &[
+                (
+                    "收款ZFFX000001",
+                    "2026-08-29",
+                    "商品甲",
+                    "品牌甲",
+                    "家电",
+                    "无编号",
+                    "10.00",
+                ),
+                (
+                    "收款ZFFX000002",
+                    "2026-08-30",
+                    "商品乙",
+                    "品牌乙",
+                    "家电",
+                    "参考号：16867252734N",
+                    "20.00",
+                ),
+                (
+                    "收款ZFFX000003",
+                    "2026-08-31",
+                    "商品丙",
+                    "品牌丙",
+                    "家电",
+                    "无编号",
+                    "30.00",
+                ),
+            ],
+        );
+
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 3);
+
+        // 前部：第二行（第二阶段命中）与第三行（未命中），保持在顶部且无填色
+        assert_eq!(table.rows[0].values[0], Value::Text("收款ZFFX000002".to_string()));
+        assert_eq!(table.rows[0].values[10], Value::Text("已上传".to_string()));
+        assert_eq!(table.rows[0].fill, None);
+
+        assert_eq!(table.rows[1].values[0], Value::Text("收款ZFFX000003".to_string()));
+        assert_eq!(table.rows[1].values[10], Value::Text("未上传".to_string()));
+        assert_eq!(table.rows[1].fill, None);
+
+        // 底部：第一行（第一阶段命中），填粉色并沉底
+        assert_eq!(table.rows[2].values[0], Value::Text("收款ZFFX000001".to_string()));
+        assert_eq!(table.rows[2].values[10], Value::Text("退货-退单".to_string()));
+        assert_eq!(table.rows[2].fill, Some(Fill::Pink));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

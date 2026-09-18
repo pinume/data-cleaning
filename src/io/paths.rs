@@ -5,15 +5,11 @@ use crate::model::ProcessError;
 /// 去除首尾空白，并在结果首尾为成对单引号或双引号时去除该对引号。
 fn normalize_raw_path(raw: &str) -> String {
     let trimmed = raw.trim();
-    let bytes = trimmed.as_bytes();
-    let unquoted = if bytes.len() >= 2
-        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
-            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(trimmed);
     unquoted.trim().to_string()
 }
 

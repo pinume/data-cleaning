@@ -11,7 +11,7 @@ use crate::model::{ProcessError, Table};
 /// 逐项报告各自的成功或失败结果。
 pub fn run_all(input_dir: &Path) {
     for job in jobs::registry() {
-        execute(job.as_ref(), input_dir);
+        execute(*job, input_dir);
     }
 }
 
@@ -19,10 +19,10 @@ pub fn run_all(input_dir: &Path) {
 /// 已在`1..=9`范围内校验过，`registry()`固定收录这9个类别，查找必然命中。
 pub fn run_one(input_dir: &Path, category_number: u32) {
     let job = jobs::registry()
-        .into_iter()
+        .iter()
         .find(|job| job.category() as u32 == category_number)
         .expect("category_number 应已由调用方校验在 registry() 收录的范围内");
-    execute(job.as_ref(), input_dir);
+    execute(*job, input_dir);
 }
 
 fn execute(job: &dyn Job, input_dir: &Path) {

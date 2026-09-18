@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 
 use crate::io::xlsx_reader::RawCell;
 use crate::model::{ProcessError, Table, Value};
-use crate::utils::{dates, doc_no, numbers, text};
+use crate::utils::{dates, doc_no, text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -80,7 +81,7 @@ pub(crate) fn cell_amount(cell: &RawCell) -> Result<Option<Decimal>, String> {
             .map(Some)
             .map_err(|_| format!("文本“{t}”无法解析为十进制金额")),
         RawCell::Int(n) => Ok(Some(Decimal::from(*n))),
-        RawCell::Float(f) => numbers::from_f64(*f)
+        RawCell::Float(f) => Decimal::from_f64(*f)
             .map(Some)
             .ok_or_else(|| format!("数值 {f} 无法转换为十进制金额")),
         other => Err(format!("金额字段出现非数值内容：{}", cell_display(other))),
@@ -254,19 +255,21 @@ pub mod union_subsidy;
 pub mod unionpay;
 pub mod uploaded;
 
+static REGISTRY: [&(dyn Job + Sync); 9] = [
+    &invoice::InvoiceJob,
+    &union_subsidy::UnionSubsidyJob,
+    &uploaded::UPLOADED_DIGITAL,
+    &uploaded::UPLOADED_APPLIANCE,
+    &unionpay::UnionPayJob,
+    &refund::REFUND_APPLIANCE,
+    &refund::REFUND_DIGITAL,
+    &receipts::ReceiptsJob,
+    &coupons::CouponsJob,
+];
+
 /// 按菜单编号 1–9 排列的全部任务；`app::runner`据此驱动单类或批量执行。
-pub fn registry() -> Vec<Box<dyn Job>> {
-    vec![
-        Box::new(invoice::InvoiceJob),
-        Box::new(union_subsidy::UnionSubsidyJob),
-        Box::new(uploaded::UPLOADED_DIGITAL),
-        Box::new(uploaded::UPLOADED_APPLIANCE),
-        Box::new(unionpay::UnionPayJob),
-        Box::new(refund::REFUND_APPLIANCE),
-        Box::new(refund::REFUND_DIGITAL),
-        Box::new(receipts::ReceiptsJob),
-        Box::new(coupons::CouponsJob),
-    ]
+pub fn registry() -> &'static [&'static (dyn Job + Sync)] {
+    &REGISTRY
 }
 
 #[cfg(test)]
